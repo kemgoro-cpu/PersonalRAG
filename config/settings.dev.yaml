@@ -12,6 +12,9 @@ paths:
   chromadb_dir: data/chromadb        # ベクターDB 永続化先
   recordings_dir: data/recordings    # マイク録音の保存先
   logs_dir: data/logs                # ログ出力先
+  # テキスト取り込み用: Teams/iPhone/Zoom 等の既成文字起こしを投入する
+  input_text_dir: data/input_text               # テキストファイル投入先
+  processed_text_dir: data/input_text/processed # 処理済みテキストの退避先
 
 # --- Step 1: 文字起こし設定 ---
 whisper:
@@ -78,8 +81,10 @@ chromadb:
 
 # --- Step 4: パイプライン設定 ---
 pipeline:
-  # data/input/ で監視する拡張子
+  # data/input/ で監視する拡張子（音声）
   watch_extensions: [".wav", ".mp3", ".m4a", ".flac", ".ogg"]
+  # テキスト取り込み用: data/input_text/ で監視する拡張子
+  text_extensions: [".txt", ".vtt", ".docx", ".md"]
   # ファイル書き込みが完了したと判定するまでの待機秒数
   # （録音アプリが書き込み中のファイルを誤検知しないよう少し待つ）
   stable_wait_seconds: 3

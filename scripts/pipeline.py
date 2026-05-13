@@ -257,11 +257,154 @@ class AudioFileHandler(FileSystemEventHandler):
             self._processing.discard(path_str)
 
 
-def process_existing_files(
-    input_dir: Path, settings: dict[str, Any], logger: logging.Logger
+def process_text(
+    text_path: Path,
+    settings: dict[str, Any],
+    logger: logging.Logger,
 ) -> None:
-    """起動時、既に input/ にあるファイル（processed/ 除く）を順次処理する。"""
-    extensions = {ext.lower() for ext in settings["pipeline"]["watch_extensions"]}
+    """1 つのテキストファイルに対して Step 1-alt → 2 → 3 を順次実行する。
+
+    process_audio と同じ構造で、Step 1 だけ import_transcript.py に置き換えている。
+    これにより音声フローとテキストフローを完全に分離でき、リグレッションリスクを
+    最小化できる。
+
+    Args:
+        text_path: 処理対象のテキストファイル（.txt / .vtt / .docx / .md）。
+        settings: load_settings() で読み込んだ設定辞書。
+        logger: ロガー。
+    """
+    logger.info(f"=== テキスト処理開始: {text_path.name} ===")
+
+    transcripts_dir = resolve_path(settings["paths"]["transcripts_dir"])
+    notes_dir = resolve_path(settings["paths"]["notes_dir"])
+    processed_text_dir = resolve_path(settings["paths"]["processed_text_dir"])
+    processed_text_dir.mkdir(parents=True, exist_ok=True)
+
+    # 書き込み中ファイルでないことを確認（コピー中のファイルを誤処理しないため）
+    if not wait_until_stable(
+        text_path, settings["pipeline"]["stable_wait_seconds"], logger
+    ):
+        logger.warning(f"スキップ: {text_path.name}")
+        return
+
+    # Step 1-alt: テキスト → 正規化 transcript
+    if not run_step("import_transcript.py", [str(text_path)], logger):
+        logger.error("Step 1-alt 失敗のため後続をスキップ")
+        return
+
+    # import_transcript.py も transcribe.py と同じ命名規則で出力するため、
+    # 同じ find_latest_transcript 関数で探せる
+    transcript_path = find_latest_transcript(transcripts_dir, text_path.stem)
+    if not transcript_path:
+        logger.error(
+            f"transcript が見つかりません（text_stem={text_path.stem}）。後続をスキップ"
+        )
+        return
+    logger.info(f"transcript: {transcript_path.name}")
+
+    # Step 2: 要約
+    if not run_step("summarize.py", [str(transcript_path)], logger):
+        logger.error("Step 2 失敗のため Step 3 をスキップ")
+        return
+
+    note_path = find_latest_note(notes_dir, transcript_path.stem)
+    if not note_path:
+        logger.error("note が見つかりません。Step 3 をスキップ")
+        return
+    logger.info(f"note: {note_path.name}")
+
+    # Step 3: ChromaDB 投入
+    if not run_step("ingest_db.py", [str(note_path)], logger):
+        logger.error("Step 3 失敗")
+        return
+
+    # 処理済みテキストを退避（重複処理防止）
+    try:
+        dest = processed_text_dir / text_path.name
+        # 同名ファイルがあれば連番を付けて上書き防止
+        if dest.exists():
+            stem, suffix = dest.stem, dest.suffix
+            for n in range(1, 999):
+                alt = processed_text_dir / f"{stem}_{n:03d}{suffix}"
+                if not alt.exists():
+                    dest = alt
+                    break
+        shutil.move(str(text_path), str(dest))
+        logger.info(f"退避: {text_path.name} → {dest.relative_to(PROJECT_ROOT)}")
+    except Exception as e:
+        logger.error(f"退避失敗: {e}")
+
+    logger.info(f"=== テキスト処理完了: {text_path.name} ===\n")
+
+
+class TextFileHandler(FileSystemEventHandler):
+    """data/input_text/ に新規テキストファイルが投入されたら処理する watchdog ハンドラ。
+
+    AudioFileHandler と同じパターンで実装しており、
+    監視対象の拡張子と呼び出す処理関数だけが異なる。
+    """
+
+    def __init__(
+        self,
+        settings: dict[str, Any],
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__()
+        self.settings = settings
+        self.logger = logger
+        self.text_extensions: set[str] = {
+            ext.lower() for ext in settings["pipeline"]["text_extensions"]
+        }
+        # 既に処理キューに入れたパスを記録（重複イベント抑止）
+        self._processing: set[str] = set()
+
+    def on_created(self, event: Any) -> None:
+        self._handle(event)
+
+    def on_moved(self, event: Any) -> None:
+        # ドラッグ&ドロップだと「一時ファイル作成→リネーム」になるケースがある
+        self._handle(event, use_dest=True)
+
+    def _handle(self, event: Any, use_dest: bool = False) -> None:
+        if event.is_directory:
+            return
+        path_str = event.dest_path if use_dest else event.src_path
+        path = Path(path_str)
+
+        # processed/ サブフォルダの変動は無視
+        if "processed" in path.parts:
+            return
+
+        if path.suffix.lower() not in self.text_extensions:
+            return
+
+        if path_str in self._processing:
+            return
+        self._processing.add(path_str)
+        try:
+            process_text(path, self.settings, self.logger)
+        finally:
+            self._processing.discard(path_str)
+
+
+def process_existing_files(
+    input_dir: Path,
+    settings: dict[str, Any],
+    logger: logging.Logger,
+    extensions_key: str = "watch_extensions",
+) -> None:
+    """起動時、既に input/ にあるファイル（processed/ 除く）を順次処理する。
+
+    音声・テキスト両方で使えるよう extensions_key を引数にして汎化している。
+    デフォルトは音声用の "watch_extensions"。テキスト用は "text_extensions" を渡す。
+
+    Args:
+        input_dir: 監視対象ディレクトリ。
+        settings: 設定辞書。
+        logger: ロガー。
+        extensions_key: settings["pipeline"] の中の、対象拡張子リストのキー名。
+    """
+    extensions = {ext.lower() for ext in settings["pipeline"][extensions_key]}
     candidates = [
         p
         for p in input_dir.iterdir()
@@ -269,9 +412,17 @@ def process_existing_files(
     ]
     if not candidates:
         return
-    logger.info(f"起動時の未処理ファイル {len(candidates)} 件を処理します。")
+
+    # 処理の種類を判断するために extensions_key を使う
+    is_text_mode = extensions_key == "text_extensions"
+    mode_label = "テキスト" if is_text_mode else "音声"
+
+    logger.info(f"起動時の未処理{mode_label}ファイル {len(candidates)} 件を処理します。")
     for path in candidates:
-        process_audio(path, settings, logger)
+        if is_text_mode:
+            process_text(path, settings, logger)
+        else:
+            process_audio(path, settings, logger)
 
 
 def main() -> int:
@@ -281,16 +432,29 @@ def main() -> int:
     log_dir = resolve_path(settings["paths"]["logs_dir"])
     input_dir.mkdir(parents=True, exist_ok=True)
 
+    # テキスト取り込み用ディレクトリを作成する（無ければ自動生成）
+    text_input_dir = resolve_path(settings["paths"]["input_text_dir"])
+    text_input_dir.mkdir(parents=True, exist_ok=True)
+
     logger = setup_logger(log_dir)
-    logger.info(f"フォルダ監視を開始: {input_dir}")
+    logger.info(f"音声フォルダ監視を開始: {input_dir}")
+    logger.info(f"テキスト監視も開始: {text_input_dir}")
     logger.info("Ctrl+C で終了します。")
 
-    # 起動時のキャッチアップ処理
-    process_existing_files(input_dir, settings, logger)
+    # 起動時のキャッチアップ処理（音声）
+    process_existing_files(input_dir, settings, logger, extensions_key="watch_extensions")
 
-    handler = AudioFileHandler(settings, logger)
+    # 起動時のキャッチアップ処理（テキスト）
+    process_existing_files(text_input_dir, settings, logger, extensions_key="text_extensions")
+
+    audio_handler = AudioFileHandler(settings, logger)
+    text_handler = TextFileHandler(settings, logger)
+
     observer = Observer()
-    observer.schedule(handler, str(input_dir), recursive=False)
+    # 音声フォルダの監視（既存フロー）
+    observer.schedule(audio_handler, str(input_dir), recursive=False)
+    # テキストフォルダの監視（新規フロー）
+    observer.schedule(text_handler, str(text_input_dir), recursive=False)
     observer.start()
 
     try:

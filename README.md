@@ -22,6 +22,8 @@ PersonalRAG/
 ├── data/                   # ← .gitignore で除外（社外秘の可能性）
 │   ├── input/              # 音声ファイル投入先
 │   │   └── processed/      # 処理済み音声の退避先
+│   ├── input_text/         # テキストファイル投入先（Teams/.vtt/.txt/.md）
+│   │   └── processed/      # 処理済みテキストの退避先
 │   ├── recordings/         # マイク録音の保存先
 │   ├── transcripts/        # 文字起こし結果 (.txt)
 │   ├── notes/              # 要約・ToDo (.md)
@@ -30,6 +32,7 @@ PersonalRAG/
 ├── scripts/
 │   ├── config_loader.py    # 共通: 設定読み込み
 │   ├── transcribe.py       # Step 1: 音声 → 文字起こし
+│   ├── import_transcript.py # Step 1-alt: テキスト取り込み（Teams/.vtt/.txt/.md）
 │   ├── record_mic.py       # Step 1 補助: マイク録音
 │   ├── summarize.py        # Step 2: テキスト → 要約・ToDo
 │   ├── ingest_db.py        # Step 3: Markdown → ChromaDB
@@ -284,6 +287,36 @@ python scripts/record_mic.py
 # 録音から文字起こしまで一気にやるなら --transcribe を付与
 python scripts/record_mic.py --transcribe
 ```
+
+### B-2. 既存テキスト（Teams、iPhone、メモ等）を取り込む
+
+Teams 会議トランスクリプト（.docx）、iPhone ボイスメモの起こし（.txt）、Zoom 録画のキャプション（.vtt）など、
+既に文字起こし済みのテキストファイルを RAG に取り込めます。
+
+#### 単発取り込み（CLI）
+
+```powershell
+python scripts/import_transcript.py data/input_text/teams_meeting.docx
+python scripts/summarize.py data/transcripts/teams_meeting_2026-05-14_XXXX.txt
+python scripts/ingest_db.py data/notes/teams_meeting_2026-05-14_XXXX.md
+```
+
+#### 自動取り込み（フォルダ監視）
+
+```powershell
+python scripts/pipeline.py
+# data/input_text/ に .docx / .txt / .vtt / .md をコピーすると自動で
+# 要約 → ChromaDB 投入まで完了。処理済みファイルは data/input_text/processed/ へ退避。
+```
+
+#### 対応形式
+
+| 形式 | 想定ソース | 話者・タイムスタンプ |
+|---|---|---|
+| `.docx` | Microsoft Teams 会議トランスクリプト | 実名で抽出 |
+| `.vtt` | Zoom / Teams ライブキャプション | 抽出（`<v 名前>` タグから） |
+| `.txt` | iPhone ボイスメモ起こし、メモ全般 | 無し（プレーン本文） |
+| `.md` | Markdown メモ | 無し（プレーン本文） |
 
 ### C. CLI で類似検索（動作確認）
 
