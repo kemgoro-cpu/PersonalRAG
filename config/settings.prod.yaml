@@ -1,0 +1,94 @@
+# PersonalRAG 設定ファイル【本番機 (RTX Pro 2000 Blackwell 16GB) 向けプロファイル】
+# このファイルから config/settings.yaml にコピーして使う。
+# - setup.sh prod / setup.ps1 prod が自動でコピーする
+
+# --- パス設定 ---
+paths:
+  input_dir: data/input              # 音声ファイル投入先
+  processed_dir: data/input/processed # 処理済み音声の退避先
+  transcripts_dir: data/transcripts  # 文字起こし結果（.txt）
+  notes_dir: data/notes              # 要約・ToDo（.md）
+  chromadb_dir: data/chromadb        # ベクターDB 永続化先
+  recordings_dir: data/recordings    # マイク録音の保存先
+  logs_dir: data/logs                # ログ出力先
+
+# --- Step 1: 文字起こし設定 ---
+whisper:
+#  model: kotoba-tech/kotoba-whisper-v2.0-faster  # Hugging Face モデルID
+  model: Systran/faster-whisper-large-v3  # Hugging Face モデルID
+
+  device: cuda                       # cuda / cpu
+  # 【本番機変更点】compute_type を float16 に変更
+  # - 開発機（6GB）では int8_float16 で VRAM を節約する必要があったが、
+  #   本番機（16GB）は VRAM に余裕があるため float16（精度優先）に変更
+  # - float16 は計算を16bit浮動小数点で行う。int8_float16 より精度が高い
+  compute_type: float16
+  language: ja
+  # 自動車開発の専門用語を認識精度向上のために投入
+  # 必要に応じて自由に追加してOK
+  initial_prompt: |
+    自動車開発、ECU、CAN通信、ハーネス、ワイヤーハーネス、車両試験、
+    試作、量産、品質管理、サプライヤー、図面、仕様書、納期、コストダウン、
+    プロジェクトリーダー、技術検討、設計変更、改善提案、不具合対応
+  # VAD（音声区間検出）を有効にすると無音区間をスキップして高速化できるが、
+  # YouTube 音声や音量が小さい録音だと全部フィルタされて空結果になる場合がある。
+  # 空結果が頻発するときは false に。きれいなマイク録音中心なら true でも OK。
+  vad_filter: false
+  # no_speech_threshold: この値より「無音っぽい」と判定された区間を破棄する
+  # デフォルトは 0.6。空結果が出るなら 0.8 まで上げると吐き出しやすくなる
+  no_speech_threshold: 0.6
+
+# --- Step 1: 話者分離設定 ---
+diarization:
+  enabled: true                      # false にすると話者分離をスキップ
+  model: pyannote/speaker-diarization-3.1
+  # 【本番機変更点】device を cuda に変更
+  # - 開発機（6GB）では whisper との GPU 競合が怖いため cpu に設定していた
+  # - 本番機（16GB）は VRAM に余裕がある。さらに pipeline.py が Step 1（文字起こし）と
+  #   Step 2（LLM）を別プロセスとして順番に起動する設計のため、whisper と話者分離は
+  #   同じ Step 1 内で動き、Gemma（LLM）とは絶対に同時起動しない。
+  #   そのため、話者分離を cuda で動かしても安全
+  device: cuda                       # cuda / cpu
+  min_speakers: 1
+  max_speakers: 6
+
+# --- Step 1: マイク録音設定 ---
+recording:
+  sample_rate: 16000                 # whisper の入力に合わせる
+  channels: 1                        # モノラル
+  format: wav
+
+# --- Step 2: LLM 設定 ---
+llm:
+  # 【本番機変更点】モデルを gemma4:e4b-it-q4_K_M に変更
+  # - 開発機（6GB）では VRAM が少ないため最小モデル gemma3:4b を使用
+  # - Gemma 4 26B（フルサイズ）は 18GB 必要なので 16GB VRAM ではオーバー
+  # - gemma4:e4b-it-q4_K_M は量子化（データを圧縮して軽量化）した Gemma 4 Efficient 4B。
+  #   約 9.6GB の VRAM で動作し、16GB 本番機では安定して使える。
+  #   量子化しても 4B より賢く、日本語精度も高い
+  model: gemma4:e4b-it-q4_K_M
+  host: http://localhost:11434
+  temperature: 0.3                   # 要約は低めで安定させる
+  num_ctx: 8192                      # コンテキスト長（長文会議対応）
+  # Ollama に渡す keep_alive。0 にすると応答後すぐにメモリ解放
+  # 文字起こしや Open WebUI との VRAM 競合を避けるため 0 を推奨
+  keep_alive: 0
+
+# --- Step 3: 埋め込み・ベクターDB 設定 ---
+embedding:
+  model: nomic-embed-text
+  host: http://localhost:11434
+
+chromadb:
+  collection_name: personal_rag
+  # チャンク分割の目安（トークンではなく文字数で簡易判定）
+  chunk_chars: 1500
+  chunk_overlap_chars: 200
+
+# --- Step 4: パイプライン設定 ---
+pipeline:
+  # data/input/ で監視する拡張子
+  watch_extensions: [".wav", ".mp3", ".m4a", ".flac", ".ogg"]
+  # ファイル書き込みが完了したと判定するまでの待機秒数
+  # （録音アプリが書き込み中のファイルを誤検知しないよう少し待つ）
+  stable_wait_seconds: 3

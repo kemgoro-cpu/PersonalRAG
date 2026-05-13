@@ -1,0 +1,26 @@
+# PersonalRAG - 依存ライブラリ一覧
+# インストール方法:
+#   1. PyTorch (CUDA版) を先にインストール:
+#      pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   2. その後:
+#      pip install -r requirements.txt
+
+# --- Step 1: 音声 → 文字起こし ---
+faster-whisper>=1.0.3
+pyannote.audio>=3.1.1
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# --- Step 2: 要約・ToDo抽出 (Ollama 経由) ---
+ollama>=0.3.3
+
+# --- Step 3: ベクター検索 ---
+chromadb>=0.5.0
+
+# --- Step 4: パイプライン自動化 ---
+watchdog>=4.0.0
+
+# --- 共通: 設定・環境変数 ---
+pyyaml>=6.0.1
+python-dotenv>=1.0.1

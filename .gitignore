@@ -1,0 +1,35 @@
+# 機密情報・トークン
+.env
+*.env
+.webui_secret_key
+webui.db
+webui.db-*
+
+# 音声・文字起こし・要約データ（社外秘の可能性あり）
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.venv-webui/
+venv/
+.python-version
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ログ
+*.log
+
+# 現在の settings.yaml は環境ごとに変わるため Git 管理外
+# 環境別プロファイル（settings.dev.yaml / settings.prod.yaml）は Git 管理する
+config/settings.yaml
