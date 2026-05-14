@@ -32,6 +32,7 @@ pyyaml>=6.0.1
 python-dotenv>=1.0.1
 
 # --- Step 1-gui: 録音ボタン GUI（任意機能。CLI のみ使うなら不要）---
+# グローバルホットキーは Windows 標準 API (RegisterHotKey) を ctypes で直接叩くため
+# 追加の pip 依存は pystray と Pillow のみ。
 pystray>=0.19.5
 Pillow>=10.0.0
-keyboard>=0.13.5

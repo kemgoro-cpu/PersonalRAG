@@ -45,7 +45,7 @@ class Recorder:
         sample_rate: int,
         channels: int,
         silence_threshold: float = 0.001,
-        silence_timeout: float = 5.0,
+        silence_timeout: float = 10.0,
         warmup_seconds: float = 2.0,
     ) -> None:
         """Recorder を初期化する。
@@ -56,6 +56,7 @@ class Recorder:
             silence_threshold: 無音判定の振幅しきい値 (float32, 0.0-1.0)。
                 マイク入力の最大振幅がこの値を下回り続けると「無音」と判定する。
             silence_timeout: この秒数だけ連続で無音だと is_silent() が True を返す。
+                デフォルト 10 秒。喋り出しまでの間が長くても誤発火しにくい値。
             warmup_seconds: 録音開始直後のこの秒数は無音判定を行わない
                 (デバイス初期化の揺らぎを無視するため)。
         """
@@ -198,6 +199,18 @@ class Recorder:
         """
         with self._lock:
             return self._peak_level
+
+    def was_voice_detected(self) -> bool:
+        """この録音セッション中に一度でも音声を検知したかを返す。
+
+        warmup_seconds の影響は受けない (warmup 中でも閾値を超えた音があれば True)。
+        start() を呼ぶたびに内部の _last_voice_at は None にリセットされるので、
+        次のセッションの判定には引き継がれない。
+
+        GUI 側で「一度も音声を拾わなかった録音」を自動削除する判定に使う。
+        """
+        with self._lock:
+            return self._last_voice_at is not None
 
     # ------------------------------------------------------------------
     # 内部実装

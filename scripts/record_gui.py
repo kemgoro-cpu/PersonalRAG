@@ -16,7 +16,7 @@ scripts/record_mic.py の CLI 版と同じ Recorder クラス（scripts/recorder
     main          : tkinter mainloop（ウィジェット操作はすべてここから）
     recorder worker: Recorder.start() 内部で起動 (sounddevice + soundfile)
     pystray       : icon.run_detached() で別スレッド
-    keyboard hook : keyboard.add_hotkey() で別スレッド
+    hotkey thread : win_hotkey.GlobalHotkey (RegisterHotKey + GetMessageW)
 
 すべての操作要求は queue.Queue (command_queue) に集約し、main の _tick() で
 取り出して処理する。tkinter ウィジェットは絶対に main スレッド以外から触らない。
@@ -51,10 +51,9 @@ except ImportError:  # pragma: no cover - 起動時に分かる
     Image = None  # type: ignore[assignment]
     ImageDraw = None  # type: ignore[assignment]
 
-try:
-    import keyboard  # noqa: F401  # 型推論のため import 残す
-except ImportError:  # pragma: no cover
-    keyboard = None  # type: ignore[assignment]
+# グローバルホットキーは Windows 標準 API (RegisterHotKey) を直接叩く実装を使う。
+# keyboard ライブラリは「登録は成功するが反応しない」症状が出やすかったため撤去。
+from win_hotkey import GlobalHotkey
 
 
 class AppState(enum.Enum):
@@ -110,11 +109,22 @@ class RecordingApp:
 
         # --- トレイ・ホットキー（任意機能。失敗しても録音はできる）---
         self.tray_icon: Any = None
+        self.hotkey_manager: GlobalHotkey | None = None
+        self.hotkey_warning: str | None = None    # 起動時の登録失敗メッセージ
         self._build_tray()
         self._bind_hotkey()
 
         # 100ms 周期のコマンド・状態反映ループを開始
         self.root.after(100, self._tick)
+
+        # ホットキー登録に失敗していた場合、起動直後に一度だけ警告ダイアログを出す
+        if self.hotkey_warning is not None:
+            self.root.after(
+                300,
+                lambda: messagebox.showwarning(
+                    "ホットキー登録失敗", self.hotkey_warning
+                ),
+            )
 
     # ------------------------------------------------------------------
     # GUI 構築
@@ -241,20 +251,30 @@ class RecordingApp:
         self.tray_icon.run_detached()
 
     def _bind_hotkey(self) -> None:
-        """グローバルホットキーを登録。失敗時は警告のみ。"""
-        if keyboard is None:
-            return
+        """グローバルホットキー (Windows API: RegisterHotKey) を登録する。
+
+        登録失敗時は GUI ステータスに警告を残すだけで、アプリ自体は続行する。
+        ボタン操作・トレイ操作は引き続き使える。
+        """
         try:
-            keyboard.add_hotkey(
+            self.hotkey_manager = GlobalHotkey(
                 self.hotkey,
                 lambda: self.command_queue.put(COMMAND_TOGGLE),
             )
+            self.hotkey_manager.start()
         except Exception as exc:
-            # ライブラリが管理者権限を要求するケース等。GUI ボタンは使えるので警告だけ。
-            messagebox.showwarning(
-                "ホットキー登録失敗",
-                f"ホットキー ({self.hotkey}) の登録に失敗しました。\n"
-                f"ボタンとトレイメニューからは引き続き操作できます。\n\n{exc}",
+            # キー指定文字列のパースエラーなど
+            self.hotkey_manager = None
+            self.hotkey_warning = f"ホットキー設定エラー: {exc}"
+            return
+
+        if not self.hotkey_manager.is_active():
+            # RegisterHotKey 自体は呼べたが、他アプリと衝突したケース等
+            err = self.hotkey_manager.last_error_code()
+            self.hotkey_warning = (
+                f"ホットキー ({self.hotkey}) を登録できませんでした"
+                f"（他アプリと衝突している可能性。Windows エラーコード: {err}）。"
+                "ボタンとトレイメニューからは引き続き操作できます。"
             )
 
     # ------------------------------------------------------------------
@@ -361,6 +381,10 @@ class RecordingApp:
 
     def _stop_recording(self) -> None:
         """録音停止処理。"""
+        # 停止前に「この録音で一度でも音声を検知したか」を確認しておく。
+        # stop() 後は次の start() で内部状態がリセットされるため、停止前に取る。
+        voice_detected = self.recorder.was_voice_detected()
+
         try:
             saved = self.recorder.stop()
         except Exception as exc:
@@ -372,15 +396,29 @@ class RecordingApp:
         self.device_combobox.config(state="readonly")
         self.status_label.config(foreground="black")
 
-        if saved is not None:
+        tray_title = "PersonalRAG 録音（待機中）"
+
+        if saved is None:
+            # そもそも保存先パスが取れていない（録音開始前の異常停止など）
+            self.status_var.set("待機中")
+        elif not voice_detected:
+            # 一度も音声を検知していないので WAV を削除する
+            # pipeline.py が空っぽのファイルに無駄な文字起こしを走らせるのを防ぐ
+            try:
+                saved.unlink(missing_ok=True)
+            except Exception:
+                # 削除失敗（ファイルロック中など）は致命的ではないので握りつぶす
+                pass
+            self.status_var.set(f"無音のため削除しました: {saved.name}")
+            self.path_var.set(str(self.recordings_dir))
+            tray_title = "PersonalRAG 録音（無音破棄）"
+        else:
             self.status_var.set(f"保存しました: {saved.name}")
             self.path_var.set(str(saved))
-        else:
-            self.status_var.set("待機中")
 
         if self.tray_icon is not None and self._gray_image is not None:
             self.tray_icon.icon = self._gray_image
-            self.tray_icon.title = "PersonalRAG 録音（待機中）"
+            self.tray_icon.title = tray_title
 
     def _force_idle(self) -> None:
         """エラーで録音が止まった際に UI を待機状態へ強制復帰させる。"""
@@ -466,11 +504,11 @@ class RecordingApp:
             except Exception:
                 pass
 
-        # 終了順序: keyboard → tray → tkinter
-        # 順序を間違えると pystray スレッドが残ってプロセスが死なないことがある
-        if keyboard is not None:
+        # 終了順序: hotkey スレッド → トレイスレッド → tkinter
+        # 順序を間違えると pystray / hotkey スレッドが残ってプロセスが死なないことがある
+        if self.hotkey_manager is not None:
             try:
-                keyboard.remove_all_hotkeys()
+                self.hotkey_manager.stop()
             except Exception:
                 pass
         if self.tray_icon is not None:
