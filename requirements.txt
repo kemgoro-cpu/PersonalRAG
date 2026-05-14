@@ -30,3 +30,8 @@ requests>=2.31.0
 # --- 共通: 設定・環境変数 ---
 pyyaml>=6.0.1
 python-dotenv>=1.0.1
+
+# --- Step 1-gui: 録音ボタン GUI（任意機能。CLI のみ使うなら不要）---
+pystray>=0.19.5
+Pillow>=10.0.0
+keyboard>=0.13.5
