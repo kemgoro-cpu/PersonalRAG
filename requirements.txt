@@ -33,6 +33,7 @@ python-dotenv>=1.0.1
 
 # --- Step 1-gui: 録音ボタン GUI（任意機能。CLI のみ使うなら不要）---
 # グローバルホットキーは Windows 標準 API (RegisterHotKey) を ctypes で直接叩くため
-# 追加の pip 依存は pystray と Pillow のみ。
+# キー監視用の追加依存は不要。トースト通知のみ winotify を使う（Windows 10/11 専用）。
 pystray>=0.19.5
 Pillow>=10.0.0
+winotify>=1.1.0 ; sys_platform == 'win32'

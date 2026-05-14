@@ -55,6 +55,13 @@ except ImportError:  # pragma: no cover - 起動時に分かる
 # keyboard ライブラリは「登録は成功するが反応しない」症状が出やすかったため撤去。
 from win_hotkey import GlobalHotkey
 
+# Windows 10/11 のトースト通知 (任意機能)。pystray の notify() は Windows 11 で
+# ほぼ表示されないため、winotify で本物のトースト通知を出す。
+try:
+    from winotify import Notification as _WinotifyNotification
+except ImportError:  # pragma: no cover - 未インストール時はトーストをスキップ
+    _WinotifyNotification = None  # type: ignore[assignment]
+
 
 class AppState(enum.Enum):
     """GUI の表示状態。録音実体の状態は Recorder.is_running() を正とし、
@@ -482,14 +489,32 @@ class RecordingApp:
             )
 
         # 1) トースト通知: 最小化されていても気付ける
-        if self.tray_icon is not None:
+        #    winotify が入っていれば Windows 10/11 のシステム標準トーストを使う。
+        #    入っていない場合は pystray のレガシー API を試す（環境依存で表示されない
+        #    こともあるがフォールバックとして残す）。
+        toast_shown = False
+        if _WinotifyNotification is not None:
+            try:
+                toast = _WinotifyNotification(
+                    app_id="PersonalRAG 録音",
+                    title="PersonalRAG 録音 - 無音検知",
+                    msg=toast_message,
+                    duration="long",  # 長めに表示してから通知センターに残す
+                )
+                toast.show()
+                toast_shown = True
+            except Exception:
+                # winotify は内部で PowerShell を呼ぶ等の経路がある。失敗時はフォールバックへ
+                pass
+
+        if not toast_shown and self.tray_icon is not None:
             try:
                 self.tray_icon.notify(
                     toast_message,
                     "PersonalRAG 録音 - 無音検知",
                 )
             except Exception:
-                # トースト通知が出せない環境 (古い Windows 等) でも続行
+                # トースト通知が出せない環境でも続行（赤字表示は出ているので最低限気付ける）
                 pass
 
         # 2) Toplevel ダイアログ: ウィンドウ表示中なら詳細案内を出す
