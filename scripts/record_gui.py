@@ -86,6 +86,7 @@ class RecordingApp:
             channels=int(rec_cfg["channels"]),
             silence_threshold=float(rec_cfg.get("silence_threshold", 0.001)),
             silence_timeout=float(rec_cfg.get("silence_timeout", 10.0)),
+            voice_loss_timeout=float(rec_cfg.get("voice_loss_timeout", 60.0)),
         )
 
         # --- 状態 ---
@@ -440,7 +441,58 @@ class RecordingApp:
     # ------------------------------------------------------------------
 
     def _show_silence_dialog(self) -> None:
-        """無音検知時に一度だけ非モーダルで表示する案内ウィンドウ。"""
+        """無音検知時に一度だけ表示する案内。
+
+        Windows のトースト通知（タスクトレイ右下のバルーン）と、
+        画面に出ている GUI 用の Toplevel ダイアログを併用する。
+        最小化中はトーストだけが見えるかたち。
+
+        Recorder の判定経路（初回検知前 / 検知後の途切れ）に応じてメッセージを
+        切り替える。silence_timeout と voice_loss_timeout で意味が違うため
+        固定文言だと誤誘導になる。
+        """
+        # 経路の判定: 既に一度でも声を検知済みか
+        # True なら voice_loss_timeout 経路（会議中に声が途切れた）
+        # False なら silence_timeout 経路（マイク選択ミス等で最初から無音）
+        voice_was_detected = self.recorder.was_voice_detected()
+
+        if voice_was_detected:
+            timeout_seconds = int(self.recorder.voice_loss_timeout)
+            toast_message = (
+                f"{timeout_seconds} 秒以上、音声を検知できていません。"
+                "マイクが外れていないか確認してください。"
+            )
+            dialog_text = (
+                f"録音中に音声が途切れて {timeout_seconds} 秒以上経ちました。\n\n"
+                "マイクが外れた、ミュートになった、または長時間沈黙が\n"
+                "続いている可能性があります。\n"
+                "問題なければそのまま録音を続けてください。"
+            )
+        else:
+            timeout_seconds = int(self.recorder.silence_timeout)
+            toast_message = (
+                f"{timeout_seconds} 秒間音声を検知できません。"
+                "マイクの選択や接続を確認してください。"
+            )
+            dialog_text = (
+                f"録音開始から {timeout_seconds} 秒経っても音声を検知できません。\n\n"
+                "マイクの選択ミスや差し直しが原因のことが多いです。\n"
+                "「録音を停止する」を押してから正しいマイクを選び、\n"
+                "もう一度録音開始してください。"
+            )
+
+        # 1) トースト通知: 最小化されていても気付ける
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.notify(
+                    toast_message,
+                    "PersonalRAG 録音 - 無音検知",
+                )
+            except Exception:
+                # トースト通知が出せない環境 (古い Windows 等) でも続行
+                pass
+
+        # 2) Toplevel ダイアログ: ウィンドウ表示中なら詳細案内を出す
         dialog = tk.Toplevel(self.root)
         dialog.title("音声が入っていません")
         dialog.geometry("420x180")
@@ -449,12 +501,7 @@ class RecordingApp:
 
         ttk.Label(
             dialog,
-            text=(
-                "10 秒間連続で無音を検知しました。\n\n"
-                "マイクの選択ミスや差し直しが原因のことが多いです。\n"
-                "「録音を停止する」を押してから正しいマイクを選び、\n"
-                "もう一度録音開始してください。"
-            ),
+            text=dialog_text,
             justify="left",
             padding=(16, 12),
         ).pack(fill="x")

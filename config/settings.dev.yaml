@@ -58,7 +58,8 @@ recording:
   # --- 以下は GUI (scripts/record_gui.py) 起動時のみ参照される ---
   hotkey: "ctrl+alt+r"              # グローバルホットキー。例: "ctrl+shift+f12"
   silence_threshold: 0.001           # 無音判定の振幅しきい値（float32, 0.0-1.0）
-  silence_timeout: 10.0              # この秒数連続で無音だと警告（録音は継続）
+  silence_timeout: 10.0              # 録音開始から最初の音声検知まで待つ秒数（マイク選択ミス早期検知用）
+  voice_loss_timeout: 60.0           # 直近の声から次の声までこの秒数経つと警告（会議中の沈黙を許容）
 
 # --- Step 2: LLM 設定 ---
 llm:

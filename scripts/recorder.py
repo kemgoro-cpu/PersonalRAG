@@ -46,6 +46,7 @@ class Recorder:
         channels: int,
         silence_threshold: float = 0.001,
         silence_timeout: float = 10.0,
+        voice_loss_timeout: float = 60.0,
         warmup_seconds: float = 2.0,
     ) -> None:
         """Recorder を初期化する。
@@ -55,8 +56,13 @@ class Recorder:
             channels: チャンネル数 (1=モノラル)。
             silence_threshold: 無音判定の振幅しきい値 (float32, 0.0-1.0)。
                 マイク入力の最大振幅がこの値を下回り続けると「無音」と判定する。
-            silence_timeout: この秒数だけ連続で無音だと is_silent() が True を返す。
-                デフォルト 10 秒。喋り出しまでの間が長くても誤発火しにくい値。
+            silence_timeout: 録音開始から最初の音声検知までの許容秒数。
+                一度も音声を拾えていない状態でこの秒数が経つと is_silent() が True を返す。
+                マイク選択ミスの早期検知が目的。デフォルト 10 秒。
+            voice_loss_timeout: 直近の音声検知から次の音声検知までの許容秒数。
+                一度でも声を拾った後、この秒数だけ無音が続くと is_silent() が True を返す。
+                会議中の長い沈黙を許容するため、silence_timeout より大きい値を推奨。
+                デフォルト 60 秒。
             warmup_seconds: 録音開始直後のこの秒数は無音判定を行わない
                 (デバイス初期化の揺らぎを無視するため)。
         """
@@ -64,6 +70,7 @@ class Recorder:
         self.channels = channels
         self.silence_threshold = silence_threshold
         self.silence_timeout = silence_timeout
+        self.voice_loss_timeout = voice_loss_timeout
         self.warmup_seconds = warmup_seconds
 
         # コールバックから受け取るオーディオチャンクを溜める queue
@@ -169,19 +176,16 @@ class Recorder:
             return self._error
 
     def is_silent(self) -> bool:
-        """直近 silence_timeout 秒の間、無音が続いているかを返す。
+        """無音判定を行う。
 
-        ウォームアップ期間中 (録音開始直後 warmup_seconds 秒) は常に False。
-
-        判定式:
-            基準時刻 = self._last_voice_at （直近に声を検知した時刻）
-                       なければ self._started_at （録音開始時刻）
-            now - 基準時刻 >= silence_timeout なら無音
-
-        この設計により:
-            - まだ一度も声を検知していなくても、録音開始から silence_timeout 秒
-              経つまでは「無音」とは判定しない（喋り出すまでの間を許容する）
-            - 一度声を検知した後は、その時点から silence_timeout 秒だけ無音判定を待つ
+        判定ロジック:
+            - ウォームアップ中 (録音開始から warmup_seconds 秒以内): 常に False
+            - まだ一度も音声を検知していない場合:
+                  now - started_at >= silence_timeout なら True
+                  (= マイクが死んでいるケースの早期検知。デフォルト 10 秒)
+            - 一度でも音声を検知済みの場合:
+                  now - last_voice_at >= voice_loss_timeout なら True
+                  (= 会議中の長い沈黙を許容。デフォルト 60 秒)
         """
         with self._lock:
             if not self._running:
@@ -193,13 +197,15 @@ class Recorder:
             return False
 
         now = time.monotonic()
-        # ウォームアップ中は判定しない
+        # ウォームアップ中は判定しない（デバイス初期化直後の揺らぎを無視）
         if now - started_at < self.warmup_seconds:
             return False
 
-        # 基準時刻: 一度でも声を検知していればその時刻、なければ録音開始時刻
-        reference = last_voice_at if last_voice_at is not None else started_at
-        return (now - reference) >= self.silence_timeout
+        if last_voice_at is None:
+            # 一度も声を拾えていない → 初回検知用タイムアウトで判定
+            return (now - started_at) >= self.silence_timeout
+        # 既に一度は声を拾った → 声が途切れた長さで判定
+        return (now - last_voice_at) >= self.voice_loss_timeout
 
     def peak_level(self) -> float:
         """直近のオーディオバッファのピーク振幅 (0.0-1.0) を返す。
