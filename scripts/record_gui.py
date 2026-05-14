@@ -85,7 +85,7 @@ class RecordingApp:
             sample_rate=int(rec_cfg["sample_rate"]),
             channels=int(rec_cfg["channels"]),
             silence_threshold=float(rec_cfg.get("silence_threshold", 0.001)),
-            silence_timeout=float(rec_cfg.get("silence_timeout", 5.0)),
+            silence_timeout=float(rec_cfg.get("silence_timeout", 10.0)),
         )
 
         # --- 状態 ---
@@ -450,7 +450,7 @@ class RecordingApp:
         ttk.Label(
             dialog,
             text=(
-                "5 秒間連続で無音を検知しました。\n\n"
+                "10 秒間連続で無音を検知しました。\n\n"
                 "マイクの選択ミスや差し直しが原因のことが多いです。\n"
                 "「録音を停止する」を押してから正しいマイクを選び、\n"
                 "もう一度録音開始してください。"
