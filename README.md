@@ -279,6 +279,37 @@ python scripts/pipeline.py
 
 別ターミナルで `data/input/` に音声ファイルをコピーすると、自動で文字起こし → 要約 → DB 投入されます。
 
+#### パイプライン状態の確認方法
+
+`pipeline.py` は処理の進捗を `data/logs/pipeline_state.json` に随時書き出しています。
+
+```json
+{
+  "updated_at": "2026-05-15T14:30:22+09:00",
+  "current": {"file": "rec_xxx.wav", "step": "summarize", "started_at": "..."},
+  "queue": ["meeting_notes.docx"],
+  "recent": [
+    {"file": "rec_xxx.wav", "result": "success", "finished_at": "...", "note_path": "..."},
+    {"file": "broken.wav",  "result": "failed",  "finished_at": "...", "error": "..."}
+  ]
+}
+```
+
+**GUI から確認する（おすすめ）**: 録音 GUI のメインウィンドウ下部に「パイプライン状態」セクションがあります。
+- 「現在:」— 処理中のファイル名とステップ（文字起こし中 / 要約中 / DB 投入中）が表示されます
+- 「最近の処理（直近 24h）:」— 直近 24 時間の成功・失敗件数が表示されます
+- 「詳細...」ボタン — 最近の処理一覧が表示され、成功行をクリックするとノートを既定アプリで開けます
+
+**通知**: 処理が完了または失敗すると Windows トースト通知が届きます。
+成功通知は `config/settings.yaml` の `pipeline.notify_on_success: false` で抑制できます。
+失敗通知は常に表示されます（気付けるよう抑制不可）。
+
+```yaml
+pipeline:
+  notify_on_success: true   # false にすると成功時のトーストを出さない
+  state_file: data/logs/pipeline_state.json  # 状態ファイルの場所
+```
+
 ### B. マイクから録音する
 
 ```powershell

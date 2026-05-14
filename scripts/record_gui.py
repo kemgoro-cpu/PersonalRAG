@@ -25,11 +25,13 @@ scripts/record_mic.py の CLI 版と同じ Recorder クラス（scripts/recorder
 from __future__ import annotations
 
 import enum
+import json
+import os
 import queue
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +40,7 @@ from tkinter import messagebox, ttk
 
 import sounddevice as sd
 
-from config_loader import load_settings, resolve_path
+from config_loader import load_settings, resolve_path, PROJECT_ROOT
 from recorder import Recorder
 
 
@@ -87,6 +89,14 @@ class RecordingApp:
         self.recordings_dir: Path = resolve_path(settings["paths"]["recordings_dir"])
         self.hotkey: str = rec_cfg.get("hotkey", "ctrl+alt+r")
 
+        # --- パイプライン状態ファイルのパス（pipeline.py が書き出すファイルを読む） ---
+        state_file_rel = settings.get("pipeline", {}).get(
+            "state_file", "data/logs/pipeline_state.json"
+        )
+        self._pipeline_state_file: Path = resolve_path(state_file_rel)
+        # 最後に状態ファイルを読んだ時刻（1 秒スロットリング用）
+        self._pipeline_state_last_read: float = 0.0
+
         # --- 録音エンジン ---
         self.recorder = Recorder(
             sample_rate=int(rec_cfg["sample_rate"]),
@@ -111,7 +121,8 @@ class RecordingApp:
         # --- GUI 構築 ---
         self.root = tk.Tk()
         self.root.title("PersonalRAG 録音")
-        self.root.geometry("520x300")
+        # パイプライン状態セクション追加に伴い高さを拡張
+        self.root.geometry("520x420")
         self.root.resizable(False, False)
         self._build_window()
 
@@ -179,6 +190,32 @@ class RecordingApp:
             foreground="#888",
             font=("", 9),
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        # --- パイプライン状態セクション ---
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=6, column=0, columnspan=2, sticky="we", pady=(12, 8)
+        )
+        ttk.Label(frame, text="パイプライン状態", font=("", 10, "bold")).grid(
+            row=7, column=0, columnspan=2, sticky="w"
+        )
+
+        # 現在処理中のファイル表示
+        self._pipeline_current_var = tk.StringVar(value="待機中")
+        ttk.Label(frame, text="現在:").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            frame, textvariable=self._pipeline_current_var, foreground="#333"
+        ).grid(row=8, column=1, sticky="w", pady=(4, 0))
+
+        # 直近 24 時間の成功/失敗カウント表示
+        self._pipeline_recent_var = tk.StringVar(value="最近の処理: — 件")
+        ttk.Label(frame, textvariable=self._pipeline_recent_var, foreground="#555").grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=(2, 0)
+        )
+
+        # 詳細ボタン（直近の処理一覧を Toplevel で表示）
+        ttk.Button(
+            frame, text="詳細...", command=self._show_pipeline_detail, width=8
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -331,7 +368,13 @@ class RecordingApp:
                 if self.tray_icon is not None:
                     self.tray_icon.title = f"PersonalRAG 録音中 {elapsed_str}"
 
-        # 4) 次回呼び出しを予約
+        # 4) パイプライン状態ファイルを読んで GUI を更新（最終読み込みから 1 秒以上経った時のみ）
+        now = time.monotonic()
+        if now - self._pipeline_state_last_read >= 1.0:
+            self._pipeline_state_last_read = now
+            self._update_pipeline_status()
+
+        # 5) 次回呼び出しを予約
         self.root.after(100, self._tick)
 
     # ------------------------------------------------------------------
@@ -442,6 +485,142 @@ class RecordingApp:
         if self.tray_icon is not None and self._gray_image is not None:
             self.tray_icon.icon = self._gray_image
             self.tray_icon.title = "PersonalRAG 録音（待機中）"
+
+    # ------------------------------------------------------------------
+    # パイプライン状態表示
+    # ------------------------------------------------------------------
+
+    def _update_pipeline_status(self) -> None:
+        """pipeline_state.json を読んでパイプライン状態 UI を更新する。
+
+        ファイルが存在しない・JSON パース失敗の場合は「待機中」にフォールバックする。
+        ファイル I/O は try/except で握って GUI を止めない。
+        """
+        try:
+            if not self._pipeline_state_file.exists():
+                self._pipeline_current_var.set("待機中（pipeline 未起動）")
+                self._pipeline_recent_var.set("最近の処理: — 件")
+                return
+
+            text = self._pipeline_state_file.read_text(encoding="utf-8")
+            data = json.loads(text)
+
+            # 現在処理中の表示
+            current = data.get("current")
+            if current:
+                step_label = {
+                    "transcribe": "文字起こし中",
+                    "summarize": "要約中",
+                    "ingest": "DB 投入中",
+                }.get(current.get("step", ""), current.get("step", "処理中"))
+                self._pipeline_current_var.set(
+                    f"{current.get('file', '')}  ({step_label})"
+                )
+            else:
+                self._pipeline_current_var.set("待機中")
+
+            # 直近 24 時間の成功/失敗カウント
+            recent = data.get("recent", [])
+            now_ts = datetime.now(timezone.utc)
+            success_count = 0
+            fail_count = 0
+            for entry in recent:
+                finished_at_str = entry.get("finished_at", "")
+                try:
+                    # ISO8601 文字列をパース（Python 3.7+ は fromisoformat 対応）
+                    finished_at = datetime.fromisoformat(finished_at_str)
+                    # タイムゾーン情報がない場合は UTC とみなす
+                    if finished_at.tzinfo is None:
+                        finished_at = finished_at.replace(tzinfo=timezone.utc)
+                    diff_hours = (now_ts - finished_at).total_seconds() / 3600
+                    if diff_hours <= 24:
+                        if entry.get("result") == "success":
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                except Exception:
+                    pass  # パース失敗のエントリは無視
+
+            self._pipeline_recent_var.set(
+                f"最近の処理（直近 24h）: ✓ {success_count} 件 / ✗ {fail_count} 件"
+            )
+
+        except Exception:
+            # ファイル読み込み失敗・JSON 壊れ等は全て無視してフォールバック
+            self._pipeline_current_var.set("待機中")
+            self._pipeline_recent_var.set("最近の処理: — 件（状態ファイル読み込み失敗）")
+
+    def _show_pipeline_detail(self) -> None:
+        """パイプライン処理の詳細一覧を Toplevel で表示する。
+
+        recent リストをテーブル形式で表示し、success 行をクリックすると
+        os.startfile() でノートを既定アプリで開く。
+        """
+        try:
+            if not self._pipeline_state_file.exists():
+                messagebox.showinfo("パイプライン詳細", "状態ファイルが見つかりません。\npipeline.py を起動してください。")
+                return
+
+            text = self._pipeline_state_file.read_text(encoding="utf-8")
+            data = json.loads(text)
+        except Exception as e:
+            messagebox.showerror("パイプライン詳細", f"状態ファイルの読み込みに失敗しました:\n{e}")
+            return
+
+        recent = data.get("recent", [])
+
+        # Toplevel ウィンドウを作成
+        detail_win = tk.Toplevel(self.root)
+        detail_win.title("パイプライン処理履歴")
+        detail_win.geometry("620x320")
+        detail_win.transient(self.root)
+
+        ttk.Label(
+            detail_win,
+            text="行をクリックすると、ノートファイルを既定アプリで開きます（成功行のみ）。",
+            font=("", 9),
+            foreground="#666",
+            padding=(8, 4),
+        ).pack(fill="x")
+
+        # テーブル（Treeview）
+        columns = ("結果", "ファイル名", "完了時刻", "備考")
+        tree = ttk.Treeview(detail_win, columns=columns, show="headings", height=12)
+        for col, width in zip(columns, [60, 220, 140, 160]):
+            tree.heading(col, text=col)
+            tree.column(col, width=width, anchor="w")
+
+        # 最新順で表示（リストは古い順なので逆順）
+        note_paths: dict[str, str] = {}  # iid → note_path のマップ
+        for entry in reversed(recent):
+            result = entry.get("result", "?")
+            filename = entry.get("file", "?")
+            finished_at = entry.get("finished_at", "")[:19].replace("T", " ")
+            if result == "success":
+                note = entry.get("note_path", "")
+                note_basename = Path(note).name if note else ""
+                iid = tree.insert("", "end", values=("✓", filename, finished_at, note_basename))
+                if note:
+                    note_paths[iid] = note
+            else:
+                error = entry.get("error", "不明")
+                tree.insert("", "end", values=("✗", filename, finished_at, error))
+
+        # クリックで note を開く
+        def _on_click(event: Any) -> None:
+            item = tree.identify_row(event.y)
+            if item and item in note_paths:
+                try:
+                    os.startfile(note_paths[item])
+                except Exception as exc:
+                    messagebox.showerror("エラー", f"ノートを開けませんでした:\n{exc}")
+
+        tree.bind("<Button-1>", _on_click)
+
+        scrollbar = ttk.Scrollbar(detail_win, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        scrollbar.pack(side="right", fill="y", pady=8, padx=(0, 8))
 
     # ------------------------------------------------------------------
     # 無音検知の通知ダイアログ（非モーダル）

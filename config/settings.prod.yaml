@@ -102,6 +102,11 @@ pipeline:
   # ファイル書き込みが完了したと判定するまでの待機秒数
   # （録音アプリが書き込み中のファイルを誤検知しないよう少し待つ）
   stable_wait_seconds: 3
+  # ファイル処理成功時に Windows トースト通知を出すか（false にすると成功通知を抑制）
+  # 失敗通知はこの設定に関わらず常に表示される
+  notify_on_success: true
+  # パイプライン処理状態の出力先（record_gui.py がここを読んで状態を表示する）
+  state_file: data/logs/pipeline_state.json
 
 # --- Step 5: Open WebUI Knowledge 自動同期設定 ---
 openwebui:
