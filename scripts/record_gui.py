@@ -13,15 +13,23 @@ scripts/record_mic.py の CLI 版と同じ Recorder クラス（scripts/recorder
     - タイトルをファイル名とサイドカー meta.json に反映する
     - 10秒間連続で無音を検知したらステータス赤字表示 + 一度だけ通知ダイアログ
     - 保存先は config/settings.yaml の paths.recordings_dir (NAS の UNC パス可)
+    - サービス管理タブで Ollama / Pipeline / Open WebUI を起動・停止・状態確認
 
 スレッド構成:
-    main          : tkinter mainloop（ウィジェット操作はすべてここから）
-    recorder worker: Recorder.start() 内部で起動 (sounddevice + soundfile)
-    pystray       : icon.run_detached() で別スレッド
-    hotkey thread : win_hotkey.GlobalHotkey (RegisterHotKey + GetMessageW)
+    main              : tkinter mainloop（ウィジェット操作はすべてここから）
+    recorder worker   : Recorder.start() 内部で起動 (sounddevice + soundfile)
+    pystray           : icon.run_detached() で別スレッド
+    hotkey thread     : win_hotkey.GlobalHotkey (RegisterHotKey + GetMessageW)
+    service poll thread: 5 秒おきに service_manager.check_all() を呼ぶ専用スレッド
 
 すべての操作要求は queue.Queue (command_queue) に集約し、main の _tick() で
 取り出して処理する。tkinter ウィジェットは絶対に main スレッド以外から触らない。
+
+サービスポーリングの設計:
+    requests.get() を _tick() 内で同期実行すると、タイムアウト 2 秒×3 サービス = 最悪
+    6 秒間 GUI が freeze する。これを避けるため、専用スレッドがバックグラウンドで
+    check_all() を呼び、結果を _service_status_cache に格納する。
+    _tick() はキャッシュを読むだけ（I/O なし）なので freeze しない。
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import logging
 import os
 import queue
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +53,7 @@ import sounddevice as sd
 
 from config_loader import load_settings, resolve_path, PROJECT_ROOT
 from recorder import Recorder
+from service_manager import ServiceManager, ServiceInfo, ServiceStatus
 
 # GUI に依存しない純粋な関数は recording_meta.py に切り出してある。
 # record_gui.py はそこから import して使う。
@@ -139,6 +149,32 @@ class RecordingApp:
         # タイトル履歴（最大 5 件、最新が先頭）
         self._title_history: list[str] = load_title_history()
 
+        # --- サービス管理（フェーズ C）---
+        self.service_manager = ServiceManager(PROJECT_ROOT, settings)
+        # ポーリングスレッドが書き込み、_tick() が読む共有キャッシュ
+        self._service_status_cache: dict[str, ServiceInfo] = {}
+        self._service_status_lock = threading.Lock()
+        # ポーリングスレッドの停止フラグ（Event.wait で割り込み可能な待機に使う）
+        self._service_poll_stop = threading.Event()
+        # daemon=True で GUI 強制終了時にスレッドも自動終了する
+        self._service_poll_thread = threading.Thread(
+            target=self._poll_services, daemon=True, name="service-poll"
+        )
+        self._service_poll_thread.start()
+
+        # サービスタブのウィジェット参照（_build_window で設定する）
+        # 各行: {"status_label": Label, "detail_label": Label, "button": Button}
+        self._service_widgets: dict[str, dict[str, Any]] = {}
+
+        # 「すべて起動」「すべて停止」ボタンの連打防止フラグ
+        # True の間は新しい一括操作スレッドを起動しない
+        # bool は GIL 保護下で atomic な読み書きができるため Lock 不要
+        self._all_services_in_progress: bool = False
+
+        # 「すべて起動」「すべて停止」ボタンのウィジェット参照（連打防止のため保持）
+        self._start_all_btn: Any = None
+        self._stop_all_btn: Any = None
+
         # --- 画像（pystray 利用可能時のみ生成） ---
         self._gray_image: Any = self._make_icon_image("gray") if Image else None
         self._red_image: Any = self._make_icon_image("red") if Image else None
@@ -146,8 +182,8 @@ class RecordingApp:
         # --- GUI 構築 ---
         self.root = tk.Tk()
         self.root.title("PersonalRAG 録音")
-        # パイプライン状態セクション追加に伴い高さを拡張
-        self.root.geometry("520x420")
+        # タブ追加に伴い高さを拡張
+        self.root.geometry("520x480")
         self.root.resizable(False, False)
         self._build_window()
 
@@ -175,10 +211,30 @@ class RecordingApp:
     # ------------------------------------------------------------------
 
     def _build_window(self) -> None:
-        """tkinter のウィジェット配置。"""
-        frame = ttk.Frame(self.root, padding=16)
-        frame.pack(fill="both", expand=True)
+        """tkinter のウィジェット配置。ttk.Notebook でタブ化する。
 
+        タブ 1「録音」: 既存の録音 UI + パイプライン状態セクション
+        タブ 2「サービス管理」: Ollama / Pipeline / Open WebUI の状態と操作
+        """
+        # Notebook（タブコンテナ）をルートウィンドウに配置
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # --- タブ 1: 録音 ---
+        recording_tab = ttk.Frame(notebook, padding=16)
+        notebook.add(recording_tab, text="録音")
+        self._build_recording_tab(recording_tab)
+
+        # --- タブ 2: サービス管理 ---
+        service_tab = ttk.Frame(notebook, padding=16)
+        notebook.add(service_tab, text="サービス管理")
+        self._build_service_tab(service_tab)
+
+        # ×ボタンの挙動: 完全終了せずトレイへ収納（トレイが無ければ確認の上で完全終了）
+        self.root.protocol("WM_DELETE_WINDOW", self._on_minimize_to_tray)
+
+    def _build_recording_tab(self, frame: ttk.Frame) -> None:
+        """「録音」タブのウィジェットを配置する（既存の録音 UI）。"""
         # マイクデバイス選択
         ttk.Label(frame, text="マイクデバイス").grid(row=0, column=0, sticky="w")
         self.device_var = tk.StringVar()
@@ -216,7 +272,7 @@ class RecordingApp:
             font=("", 9),
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        # --- パイプライン状態セクション ---
+        # --- パイプライン状態セクション（フェーズ A 成果物をここに残す）---
         ttk.Separator(frame, orient="horizontal").grid(
             row=6, column=0, columnspan=2, sticky="we", pady=(12, 8)
         )
@@ -244,8 +300,90 @@ class RecordingApp:
 
         frame.columnconfigure(1, weight=1)
 
-        # ×ボタンの挙動: 完全終了せずトレイへ収納（トレイが無ければ確認の上で完全終了）
-        self.root.protocol("WM_DELETE_WINDOW", self._on_minimize_to_tray)
+    def _build_service_tab(self, frame: ttk.Frame) -> None:
+        """「サービス管理」タブのウィジェットを配置する。
+
+        レイアウト:
+            サービス名ラベル + 状態インジケータ（●=稼働 / ○=停止）+ 詳細テキスト + 個別ボタン
+            「すべて起動」「すべて停止」ボタン
+            VRAM 競合警告ラベル（常時赤字表示）
+        """
+        # 各サービスの行を構築するヘルパー
+        SERVICE_NAMES = ["Ollama", "Pipeline", "Open WebUI"]
+
+        for row_idx, name in enumerate(SERVICE_NAMES):
+            # サービス名ラベル
+            ttk.Label(frame, text=f"{name}:", width=12, anchor="w").grid(
+                row=row_idx, column=0, sticky="w", pady=4
+            )
+            # 状態インジケータ（● 稼働中 / ○ 停止中）
+            status_label = ttk.Label(frame, text="○ 停止中", foreground="#888", width=12)
+            status_label.grid(row=row_idx, column=1, sticky="w", pady=4)
+
+            # 詳細テキスト（"稼働中" / "停止中" / "停止中（状態ファイルなし）" 等）
+            detail_label = ttk.Label(frame, text="確認中...", foreground="#aaa", width=22)
+            detail_label.grid(row=row_idx, column=2, sticky="w", pady=4)
+
+            # 個別操作ボタン（状態に応じて「起動」⇔「停止」を切替）
+            # lambda でループ変数をキャプチャするため default 引数で束縛する
+            btn = ttk.Button(
+                frame,
+                text="起動",
+                width=8,
+                command=lambda n=name: self._on_service_button(n),
+            )
+            btn.grid(row=row_idx, column=3, sticky="w", padx=(8, 0), pady=4)
+
+            # ウィジェット参照を保存（_update_service_tab で更新するため）
+            self._service_widgets[name] = {
+                "status_label": status_label,
+                "detail_label": detail_label,
+                "button": btn,
+            }
+
+        # セパレータ
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=len(SERVICE_NAMES), column=0, columnspan=4,
+            sticky="we", pady=(12, 8)
+        )
+
+        # 「すべて起動」「すべて停止」ボタン行
+        bulk_frame = ttk.Frame(frame)
+        bulk_frame.grid(row=len(SERVICE_NAMES) + 1, column=0, columnspan=4, sticky="w")
+
+        # ボタンを self に保持して、連打防止のため disable/enable を後から制御する
+        self._start_all_btn = ttk.Button(
+            bulk_frame,
+            text="すべて起動",
+            width=12,
+            command=self._on_start_all_services,
+        )
+        self._start_all_btn.pack(side="left", padx=(0, 8))
+
+        self._stop_all_btn = ttk.Button(
+            bulk_frame,
+            text="すべて停止",
+            width=12,
+            command=self._on_stop_all_services,
+        )
+        self._stop_all_btn.pack(side="left")
+
+        # VRAM 競合警告ラベル（常時赤字）
+        ttk.Label(
+            frame,
+            text=(
+                "注意: 文字起こし中の Open WebUI 起動は VRAM 競合の恐れあり。\n"
+                "Pipeline 停止後に Open WebUI を起動してください。"
+            ),
+            foreground="red",
+            font=("", 9),
+            justify="left",
+        ).grid(
+            row=len(SERVICE_NAMES) + 2, column=0, columnspan=4,
+            sticky="w", pady=(16, 0)
+        )
+
+        frame.columnconfigure(2, weight=1)
 
     def _refresh_devices(self) -> None:
         """入力デバイス一覧を Combobox に流し込む。"""
@@ -348,6 +486,28 @@ class RecordingApp:
             )
 
     # ------------------------------------------------------------------
+    # サービス状態ポーリング（バックグラウンドスレッド）
+    # ------------------------------------------------------------------
+
+    def _poll_services(self) -> None:
+        """サービス状態を 5 秒おきにポーリングするバックグラウンドスレッドの本体。
+
+        daemon=True で起動しているため GUI 強制終了時に自動で停止する。
+        通常終了時は _service_poll_stop.set() で停止を促す。
+        """
+        while not self._service_poll_stop.is_set():
+            try:
+                infos = self.service_manager.check_all()
+                # ロックを取って一括更新
+                with self._service_status_lock:
+                    for info in infos:
+                        self._service_status_cache[info.name] = info
+            except Exception as exc:
+                logger.warning(f"サービス状態取得失敗: {exc}")
+            # 5 秒間待つ（Event.wait を使うと _service_poll_stop.set() で即抜けられる）
+            self._service_poll_stop.wait(timeout=5.0)
+
+    # ------------------------------------------------------------------
     # メインループ（コマンド処理と状態反映）
     # ------------------------------------------------------------------
 
@@ -373,7 +533,7 @@ class RecordingApp:
                 self._force_idle()
                 messagebox.showerror("録音エラー", f"録音中に問題が発生しました:\n{err}")
 
-        # 3) 表示更新
+        # 3) 録音状態の表示更新
         if self.state == AppState.RECORDING:
             elapsed = int(self.recorder.elapsed())
             elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
@@ -399,7 +559,14 @@ class RecordingApp:
             self._pipeline_state_last_read = now
             self._update_pipeline_status()
 
-        # 5) 次回呼び出しを予約
+        # 5) サービス管理タブの表示更新（ロック取得 → キャッシュ参照 → 即解放）
+        #    I/O なし・ロック保持時間は数マイクロ秒なので freeze の心配なし
+        with self._service_status_lock:
+            cache_snapshot = dict(self._service_status_cache)
+        if cache_snapshot:
+            self._update_service_tab(cache_snapshot)
+
+        # 6) 次回呼び出しを予約
         self.root.after(100, self._tick)
 
     # ------------------------------------------------------------------
@@ -726,6 +893,230 @@ class RecordingApp:
             self._pipeline_current_var.set("待機中")
             self._pipeline_recent_var.set("最近の処理: — 件（状態ファイル読み込み失敗）")
 
+    # ------------------------------------------------------------------
+    # サービス管理タブの表示更新とボタン操作
+    # ------------------------------------------------------------------
+
+    def _update_service_tab(self, cache: dict[str, ServiceInfo]) -> None:
+        """サービス管理タブの各行ウィジェットをキャッシュの内容で更新する。
+
+        この関数は _tick() から main スレッドで呼ばれる。
+        ウィジェットが未作成の場合（起動直後）は何もしない。
+
+        Args:
+            cache: _service_status_cache のスナップショット。キー = サービス名。
+        """
+        for name, info in cache.items():
+            widgets = self._service_widgets.get(name)
+            if widgets is None:
+                continue
+
+            status_label: ttk.Label = widgets["status_label"]
+            detail_label: ttk.Label = widgets["detail_label"]
+            btn: ttk.Button = widgets["button"]
+
+            if info.status == ServiceStatus.RUNNING:
+                # 稼働中: 緑のインジケータ
+                status_label.config(text="● 稼働中", foreground="green")
+                detail_label.config(text=info.detail, foreground="#333")
+                # ボタンを「停止」に切替（ただしこのGUIが起動していない場合はグレーアウト）
+                with self._service_status_lock:
+                    managed = name in self.service_manager._pids
+                if managed:
+                    btn.config(text="停止", state="normal")
+                else:
+                    # 外部で起動されたサービスは停止ボタンをグレーアウト
+                    btn.config(text="停止不可", state="disabled")
+            else:
+                # 停止中: グレーのインジケータ
+                status_label.config(text="○ 停止中", foreground="#888")
+                detail_label.config(text=info.detail, foreground="#aaa")
+                btn.config(text="起動", state="normal")
+
+    def _on_service_button(self, name: str) -> None:
+        """サービス行の個別ボタン（「起動」または「停止」）が押されたときの処理。
+
+        状態に応じて start_xxx() または stop_service() を呼ぶ。
+        起動は時間がかかる可能性があるため、別スレッドで実行する。
+        ボタンを disabled にして再連打を防ぐ。
+        """
+        widgets = self._service_widgets.get(name)
+        if widgets is None:
+            return
+
+        btn: ttk.Button = widgets["button"]
+        current_text = btn.cget("text")
+
+        if current_text == "起動":
+            # ボタンを一時的に無効化
+            btn.config(state="disabled", text="起動中...")
+            # 別スレッドで起動処理（起動完了後にボタンを復帰）
+            threading.Thread(
+                target=self._start_service_thread,
+                args=(name,),
+                daemon=True,
+            ).start()
+        elif current_text == "停止":
+            btn.config(state="disabled", text="停止中...")
+            threading.Thread(
+                target=self._stop_service_thread,
+                args=(name,),
+                daemon=True,
+            ).start()
+
+    def _start_service_thread(self, name: str) -> None:
+        """サービス起動をバックグラウンドスレッドで実行する。
+
+        完了後 messagebox で結果を表示する。
+        次のポーリングサイクルで状態ラベルが自然に更新される。
+        """
+        # 名前に応じた起動メソッドを選択
+        start_methods = {
+            "Ollama": self.service_manager.start_ollama,
+            "Pipeline": self.service_manager.start_pipeline,
+            "Open WebUI": self.service_manager.start_open_webui,
+        }
+        method = start_methods.get(name)
+        if method is None:
+            return
+
+        ok, msg = method()
+
+        # ボタン状態は次のポーリングで _update_service_tab が更新するため、
+        # ここでは "起動" に戻しておくだけでよい（失敗時は「起動」に戻す）
+        widgets = self._service_widgets.get(name)
+        if widgets:
+            # main スレッドに戻して UI を更新（after(0, ...) で即キュー）
+            if ok:
+                self.root.after(0, lambda: widgets["button"].config(text="停止", state="normal"))
+            else:
+                self.root.after(0, lambda: widgets["button"].config(text="起動", state="normal"))
+
+        # 失敗時のみ messagebox（成功はポーリングで自然に反映される）
+        if not ok:
+            self.root.after(0, lambda: messagebox.showerror(f"{name} 起動失敗", msg))
+
+    def _stop_service_thread(self, name: str) -> None:
+        """サービス停止をバックグラウンドスレッドで実行する。"""
+        ok, msg = self.service_manager.stop_service(name)
+
+        widgets = self._service_widgets.get(name)
+        if widgets:
+            # 停止後は「起動」ボタンに戻す（成功・失敗を問わず）
+            self.root.after(0, lambda: widgets["button"].config(text="起動", state="normal"))
+
+        if not ok:
+            self.root.after(0, lambda: messagebox.showerror(f"{name} 停止失敗", msg))
+
+    def _on_start_all_services(self) -> None:
+        """「すべて起動」ボタン: 3 サービスをまとめて起動する。
+
+        連打防止: _all_services_in_progress フラグが True の間は何もしない。
+        フラグが False の場合のみスレッドを起動し、両ボタンを disabled にする。
+        """
+        # フラグが True = すでに別の一括操作が走っている → 無視
+        if self._all_services_in_progress:
+            return
+
+        # フラグを立てて、両ボタンを無効化（main スレッドなので直接操作可）
+        self._all_services_in_progress = True
+        if self._start_all_btn:
+            self._start_all_btn.config(state="disabled")
+        if self._stop_all_btn:
+            self._stop_all_btn.config(state="disabled")
+
+        threading.Thread(
+            target=self._start_all_services_thread,
+            daemon=True,
+        ).start()
+
+    def _start_all_services_thread(self) -> None:
+        """すべてのサービス起動をバックグラウンドで実行する。
+
+        try/finally で確実にフラグを False に戻し、ボタンを再有効化する。
+        """
+        try:
+            results = self.service_manager.start_all()
+            # 失敗したサービスのメッセージだけ表示
+            failed = {name: msg for name, (ok, msg) in results.items() if not ok}
+            if failed:
+                detail = "\n".join(f"・{name}: {msg}" for name, msg in failed.items())
+                self.root.after(
+                    0,
+                    lambda: messagebox.showwarning(
+                        "一部のサービス起動に失敗",
+                        f"以下のサービスが起動できませんでした:\n\n{detail}"
+                    ),
+                )
+        except Exception as exc:
+            logger.warning(f"すべて起動スレッド例外: {exc}")
+        finally:
+            # 例外発生時も含めて必ずフラグを False に戻す
+            self._all_services_in_progress = False
+            self.root.after(0, self._restore_all_service_buttons)
+
+    def _on_stop_all_services(self) -> None:
+        """「すべて停止」ボタン: 自分が起動した全サービスを停止する。
+
+        連打防止: _all_services_in_progress フラグが True の間は何もしない。
+        """
+        # フラグが True = すでに別の一括操作が走っている → 無視
+        if self._all_services_in_progress:
+            return
+
+        # フラグを立てて、両ボタンを無効化
+        self._all_services_in_progress = True
+        if self._start_all_btn:
+            self._start_all_btn.config(state="disabled")
+        if self._stop_all_btn:
+            self._stop_all_btn.config(state="disabled")
+
+        threading.Thread(
+            target=self._stop_all_services_thread,
+            daemon=True,
+        ).start()
+
+    def _stop_all_services_thread(self) -> None:
+        """すべてのサービス停止をバックグラウンドで実行する。
+
+        try/finally で確実にフラグを False に戻し、ボタンを再有効化する。
+        """
+        try:
+            results = self.service_manager.stop_all()
+            if not results:
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "停止",
+                        "このGUIから起動したサービスはありません。\n"
+                        "外部で起動されたサービスは停止できません。"
+                    ),
+                )
+                return
+            failed = {name: msg for name, (ok, msg) in results.items() if not ok}
+            if failed:
+                detail = "\n".join(f"・{name}: {msg}" for name, msg in failed.items())
+                self.root.after(
+                    0,
+                    lambda: messagebox.showwarning(
+                        "一部のサービス停止に失敗",
+                        f"以下のサービスが停止できませんでした:\n\n{detail}"
+                    ),
+                )
+        except Exception as exc:
+            logger.warning(f"すべて停止スレッド例外: {exc}")
+        finally:
+            # 例外発生時も含めて必ずフラグを False に戻す
+            self._all_services_in_progress = False
+            self.root.after(0, self._restore_all_service_buttons)
+
+    def _restore_all_service_buttons(self) -> None:
+        """「すべて起動」「すべて停止」ボタンを再有効化する（main スレッドから呼ぶ）。"""
+        if self._start_all_btn:
+            self._start_all_btn.config(state="normal")
+        if self._stop_all_btn:
+            self._stop_all_btn.config(state="normal")
+
     def _show_pipeline_detail(self) -> None:
         """パイプライン処理の詳細一覧を Toplevel で表示する。
 
@@ -919,7 +1310,14 @@ class RecordingApp:
         self.root.focus_force()
 
     def _on_quit_request(self) -> None:
-        """完全終了処理。録音中なら確認ダイアログを挟む。"""
+        """完全終了処理。録音中なら確認ダイアログを挟む。
+
+        終了時の方針:
+        - サービスポーリングスレッドは停止する（GUI が終了するため不要）
+        - Pipeline / Open WebUI は GUI 終了後も継続させる（ユーザーが意図せず処理を止めないため）
+        - atexit フックは service_manager.cleanup() を保険として登録しているが、
+          「自分が起動したサービスを継続させる」ため cleanup() は呼ばない設計
+        """
         if self.recorder.is_running():
             should_stop = messagebox.askyesno(
                 "確認", "録音中です。停止して終了しますか？"
@@ -930,6 +1328,10 @@ class RecordingApp:
                 self.recorder.stop()
             except Exception:
                 pass
+
+        # サービスポーリングスレッドを停止する
+        # （daemon=True なので強制終了でも問題ないが、正常に停止する）
+        self._service_poll_stop.set()
 
         # 終了順序: hotkey スレッド → トレイスレッド → tkinter
         # 順序を間違えると pystray / hotkey スレッドが残ってプロセスが死なないことがある
