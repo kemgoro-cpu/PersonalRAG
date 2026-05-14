@@ -172,7 +172,16 @@ class Recorder:
         """直近 silence_timeout 秒の間、無音が続いているかを返す。
 
         ウォームアップ期間中 (録音開始直後 warmup_seconds 秒) は常に False。
-        まだ一度も音声を検知していなければ True を返す。
+
+        判定式:
+            基準時刻 = self._last_voice_at （直近に声を検知した時刻）
+                       なければ self._started_at （録音開始時刻）
+            now - 基準時刻 >= silence_timeout なら無音
+
+        この設計により:
+            - まだ一度も声を検知していなくても、録音開始から silence_timeout 秒
+              経つまでは「無音」とは判定しない（喋り出すまでの間を許容する）
+            - 一度声を検知した後は、その時点から silence_timeout 秒だけ無音判定を待つ
         """
         with self._lock:
             if not self._running:
@@ -187,10 +196,10 @@ class Recorder:
         # ウォームアップ中は判定しない
         if now - started_at < self.warmup_seconds:
             return False
-        # 一度も声を拾っていなければ無音扱い
-        if last_voice_at is None:
-            return True
-        return (now - last_voice_at) >= self.silence_timeout
+
+        # 基準時刻: 一度でも声を検知していればその時刻、なければ録音開始時刻
+        reference = last_voice_at if last_voice_at is not None else started_at
+        return (now - reference) >= self.silence_timeout
 
     def peak_level(self) -> float:
         """直近のオーディオバッファのピーク振幅 (0.0-1.0) を返す。
