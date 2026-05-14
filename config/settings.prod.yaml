@@ -97,3 +97,18 @@ pipeline:
   # ファイル書き込みが完了したと判定するまでの待機秒数
   # （録音アプリが書き込み中のファイルを誤検知しないよう少し待つ）
   stable_wait_seconds: 3
+
+# --- Step 5: Open WebUI Knowledge 自動同期設定 ---
+openwebui:
+  # Knowledge ID 設定後に true に変えて有効化（デフォルト false でセットアップ前のノイズ警告を防ぐ）
+  enabled: false
+  # WebUI のサーバ URL（pip 版を localhost で使う場合はこのまま）
+  base_url: http://localhost:3000
+  # 同期先の Knowledge ID（空文字の場合は sync をスキップ）
+  # 取得方法: python scripts/sync_webui.py --list-knowledges
+  # 新規作成: python scripts/sync_webui.py --create-knowledge "PersonalRAG"
+  knowledge_id: ""
+  # ファイル処理完了を待つ最大秒数（大きい .md の場合は増やす）
+  poll_timeout_seconds: 60
+  # status polling の間隔（秒）
+  poll_interval_seconds: 2

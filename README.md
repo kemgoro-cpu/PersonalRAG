@@ -335,6 +335,76 @@ python scripts/search.py "先週の会議で決まった納期は？"
 
 > 自前 ChromaDB と Open WebUI 内蔵 RAG は **並行運用**しています。CLI 検索は自前 DB、チャットは Open WebUI 内蔵 DB を使う形です。
 
+### E. Open WebUI 自動同期（手動アップロード不要にする）
+
+pipeline.py が音声・テキストを処理すると、完了後に自動で WebUI Knowledge にアップロードします。
+初回だけ以下のセットアップが必要です。
+
+#### 初回セットアップ手順
+
+```bash
+# 1. venv を有効化して requests をインストール
+source .venv/Scripts/activate   # Git Bash
+# または
+.\.venv\Scripts\Activate.ps1    # PowerShell
+pip install -r requirements.txt
+
+# 2. .env に API キーを追記
+#    .env.example の OPENWEBUI_API_KEY 行を参考に、実際のキーを .env に貼る
+#    キー取得: WebUI を開いて 右上アバター → Settings → Account → API Keys
+
+# 3. WebUI を別ターミナルで起動
+source .venv-webui/Scripts/activate
+open-webui serve --port 3000
+
+# 4. Knowledge を作成して ID を確認
+python scripts/sync_webui.py --create-knowledge "PersonalRAG"
+# → 表示された ID を config/settings.yaml の openwebui.knowledge_id に貼る
+```
+
+`config/settings.yaml` の該当行を書き換えます:
+
+```yaml
+openwebui:
+  enabled: true
+  knowledge_id: "ここに表示された ID を貼る"
+```
+
+#### 初回バルクアップロード（既存 notes/ を一括 sync）
+
+```bash
+python scripts/sync_webui.py
+# → data/notes/ の全 .md が WebUI Knowledge にアップロードされる
+```
+
+#### 手動で特定ファイルを sync
+
+```bash
+python scripts/sync_webui.py data/notes/meeting_2026-05-14_1030.md
+# → そのファイルだけアップロードされる
+```
+
+#### Knowledge 一覧確認（ID を調べたいとき）
+
+```bash
+python scripts/sync_webui.py --list-knowledges
+```
+
+#### 全件再アップロード（インデックスをリセットしたいとき）
+
+```bash
+python scripts/sync_webui.py --reupload-all
+```
+
+#### WebUI が停止していた場合の回収
+
+```bash
+# WebUI を起動してから実行すると、停止中に処理されたファイルをまとめてアップロード
+python scripts/sync_webui.py
+```
+
+> 重複防止インデックスは `data/.webui_synced.json` に保存されます（`data/` 配下のため `.gitignore` で Git 管理外になっています）。
+
 ---
 
 ## 運用ルール（VRAM 競合回避のため必読）

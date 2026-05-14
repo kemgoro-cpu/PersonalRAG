@@ -192,6 +192,15 @@ def process_audio(
         logger.error("Step 3 失敗")
         return
 
+    # Step 5: Open WebUI Knowledge への自動同期（任意・失敗しても続行）
+    # この同期は WebUI が起動していない場合でも pipeline を止めない設計にしている。
+    # sync に失敗した分は後から「python scripts/sync_webui.py」で回収できる。
+    if settings.get("openwebui", {}).get("enabled", False):
+        if not run_step("sync_webui.py", [str(note_path)], logger):
+            logger.warning(
+                f"Open WebUI 同期失敗（後で sync_webui.py で回収可能）: {note_path.name}"
+            )
+
     # 処理済み音声を退避（重複処理防止）
     try:
         dest = processed_dir / audio_path.name
@@ -317,6 +326,14 @@ def process_text(
     if not run_step("ingest_db.py", [str(note_path)], logger):
         logger.error("Step 3 失敗")
         return
+
+    # Step 5: Open WebUI Knowledge への自動同期（任意・失敗しても続行）
+    # 音声フローと同じ設計。WebUI が停止中でも pipeline は完走する。
+    if settings.get("openwebui", {}).get("enabled", False):
+        if not run_step("sync_webui.py", [str(note_path)], logger):
+            logger.warning(
+                f"Open WebUI 同期失敗（後で sync_webui.py で回収可能）: {note_path.name}"
+            )
 
     # 処理済みテキストを退避（重複処理防止）
     try:
