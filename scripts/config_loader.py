@@ -57,12 +57,21 @@ def get_huggingface_token() -> str | None:
 
 
 def resolve_path(relative_path: str) -> Path:
-    """settings.yaml に書かれた相対パスをプロジェクトルート基準の絶対パスに変換する。
+    """settings.yaml に書かれたパスをプロジェクトルート基準の絶対パスに変換する。
+
+    絶対パス（UNC `\\\\server\\share\\...` やドライブ文字付き `Z:\\...` 等）が
+    渡された場合は、プロジェクトルートを付け足さずそのまま返す。
+    これにより NAS や共有ドライブを `settings.yaml` に直接書ける
+    （リモートPC運用時に input フォルダを社内 NAS に置きたいケース）。
 
     Args:
-        relative_path: 例 "data/input"
+        relative_path: 例 "data/input" や "\\\\nas-server\\share\\PersonalRAG\\input"
 
     Returns:
         絶対パスの Path オブジェクト。
     """
+    p = Path(relative_path)
+    # UNC パス・ドライブ文字付きパスは Windows でも is_absolute() が True を返す
+    if p.is_absolute():
+        return p
     return PROJECT_ROOT / relative_path

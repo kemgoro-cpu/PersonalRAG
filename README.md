@@ -407,6 +407,118 @@ python scripts/sync_webui.py
 
 ---
 
+### F. リモートPC運用構成（社内NAS共有・パターンB）
+
+GPU を持つ別の本番 PC で重い処理（文字起こし・要約・DB・Open WebUI ホスティング）を動かし、手元 PC からは「録音」と「Teams/iPhone のテキスト投入」「ブラウザでの検索チャット」だけを行う構成。社内 LAN・固定 IP・社内 NAS（社外秘データを置いてよい場所）が前提です。
+
+#### アーキテクチャ
+
+```
+[手元PC]                                              [リモートPC (RTX Pro 2000 16GB)]
+record_mic.py で録音 ─┐                            ┌─ pipeline.py 監視
+Teams .docx / .txt   ─┤                            │   transcribe → summarize → ingest_db
+                      ▼                            │                                   → sync_webui
+       \\<NAS>\PersonalRAG\input\          ───────▶│  Open WebUI (--host 0.0.0.0:3000)
+       \\<NAS>\PersonalRAG\input_text\     ───────▶│
+                                                   │
+ブラウザ http://<REMOTE-IP>:3000 ◀──────HTTP───────┘
+```
+
+**ポイント**:
+- 両PCが NAS の同じパス（例 `\\nas-server\share\PersonalRAG\input\`）を `data/input/` として参照する
+- リモートPC内の `ChromaDB` だけは絶対にローカル SSD に置く（SQLite ロック競合で破損するため）
+- `scripts/config_loader.py` の `resolve_path()` が UNC パスを素通しするため、`settings.yaml` に直接 `\\nas-server\...` と書ける
+
+#### F-1. NAS 上に共有フォルダを作る
+
+NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リモートPC・手元 PC の両方の Windows ユーザーアカウントに **「変更」権限**を付与（Everyone は不可、社外秘データ漏洩防止）。
+
+#### F-2. リモートPC側の設定
+
+1. 既存の「クイックセットアップ → prod プロファイル」を完了させる
+2. `config/settings.yaml` の `paths` セクションを編集:
+   ```yaml
+   paths:
+     # 両PCが触る分は NAS パスに
+     input_dir: \\nas-server\share\PersonalRAG\input
+     input_text_dir: \\nas-server\share\PersonalRAG\input_text
+     processed_dir: \\nas-server\share\PersonalRAG\input\processed
+     processed_text_dir: \\nas-server\share\PersonalRAG\input_text\processed
+
+     # 中間ファイル・DB はリモートPCのローカルディスクに残す
+     transcripts_dir: data/transcripts
+     notes_dir: data/notes
+     chromadb_dir: data/chromadb        # ← 絶対 NAS に置かない（SQLite ロック対策）
+     recordings_dir: data/recordings    # ← リモートでは未使用
+     logs_dir: data/logs
+   ```
+3. Open WebUI を **LAN 公開**で起動:
+   ```powershell
+   .\.venv-webui\Scripts\Activate.ps1
+   open-webui serve --port 3000 --host 0.0.0.0
+   ```
+4. Windows ファイアウォール:
+   - 「Windows Defender ファイアウォール」→「詳細設定」→「受信の規則」→「新規」
+   - 種類「ポート」→ TCP `3000` → 許可 → プロファイル「**ドメイン**」「**プライベート**」のみチェック（**パブリックは外す**）→ 名前「Open WebUI LAN」
+5. `python scripts/pipeline.py` で監視開始（NAS パスを watch）
+
+#### F-3. 手元 PC 側の設定
+
+1. リポジトリ clone + **最小依存だけ**インストール（Ollama / faster-whisper / pyannote は不要）:
+   ```powershell
+   cd C:\path\to\your\workspace
+   git clone https://github.com/kemgoro-cpu/PersonalRAG
+   cd PersonalRAG
+   python -m venv .venv-client
+   .\.venv-client\Scripts\Activate.ps1
+   pip install sounddevice soundfile numpy pyyaml python-dotenv
+   ```
+2. `config/settings.yaml` を新規作成（または `settings.dev.yaml` をコピーして編集）:
+   ```yaml
+   paths:
+     recordings_dir: \\nas-server\share\PersonalRAG\input    # ← NAS の input と同じ
+     # 以下は record_mic.py からは参照されないが、エラー回避のため一応書いておく
+     input_dir: data/input
+     input_text_dir: data/input_text
+     processed_dir: data/input/processed
+     processed_text_dir: data/input_text/processed
+     transcripts_dir: data/transcripts
+     notes_dir: data/notes
+     chromadb_dir: data/chromadb
+     logs_dir: data/logs
+
+   recording:
+     sample_rate: 16000
+     channels: 1
+     format: wav
+   ```
+3. **NAS への認証情報を Windows に覚えさせる**: エクスプローラのアドレスバーに `\\nas-server\share\` と入力 → 認証ダイアログで「資格情報を記憶する」にチェック
+
+#### F-4. 日常運用
+
+| 操作 | 手元PCで | リモートPCで |
+|---|---|---|
+| マイク録音 | `python scripts/record_mic.py` | 自動で処理開始 |
+| Teams 議事録投入 | エクスプローラで `\\nas-server\share\PersonalRAG\input_text\` にドラッグ | 自動で処理開始 |
+| 検索・チャット | ブラウザで `http://<REMOTE-IP>:3000` | （何もしない） |
+| ログ確認 | 必要時のみ RDP でリモートにログイン | RDP で `data/logs/pipeline.log` |
+
+#### F-5. 動作確認チェックリスト
+
+1. ✅ 手元 PC のエクスプローラで `\\nas-server\share\PersonalRAG\input\` が開ける
+2. ✅ リモートPCで `python scripts/pipeline.py` を起動した状態で、手元 PC から NAS へ .wav をコピーすると即座に処理が走る
+3. ✅ 手元 PC で `python scripts/record_mic.py` を実行し、録音停止後に NAS に .wav が保存される
+4. ✅ 手元 PC のブラウザで `http://<REMOTE-IP>:3000` が開ける（Open WebUI ログイン画面が出る）
+5. ✅ Open WebUI のチャットで先ほどの録音内容が Knowledge から引用されて回答される
+
+#### F-6. 注意点
+
+- **`chromadb_dir` を NAS に置かない**: SQLite が NAS（SMB）上だとロックが正しく機能せず DB 破損リスクあり。**必ずリモートPCのローカル SSD** に置く
+- **NAS が落ちると pipeline が一時停止**: NAS 復旧後にリモートPCで `pipeline.py` を再起動すれば、起動時キャッチアップで未処理ファイルが自動回収される
+- **Open WebUI を LAN に晒すリスク**: WebUI 自身のログイン認証で保護されるが、Firewall ルールで「パブリック」プロファイルは必ず外す（社外 Wi-Fi 接続時に外部公開されないように）
+
+---
+
 ## 運用ルール（VRAM 競合回避のため必読）
 
 | 状況 | やってよい / ダメ |
