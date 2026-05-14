@@ -264,39 +264,47 @@ class RecordingApp:
             row=4, column=1, sticky="w"
         )
 
+        # 「ノートを開く」ボタン（フェーズ D: ノートビューアを起動）
+        ttk.Button(
+            frame,
+            text="📖 ノートを開く",
+            command=self._open_note_viewer,
+            width=18,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         # ホットキー表示
         ttk.Label(
             frame,
             text=f"ホットキー: {self.hotkey.upper()}（settings.yaml で変更可）",
             foreground="#888",
             font=("", 9),
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         # --- パイプライン状態セクション（フェーズ A 成果物をここに残す）---
         ttk.Separator(frame, orient="horizontal").grid(
-            row=6, column=0, columnspan=2, sticky="we", pady=(12, 8)
+            row=7, column=0, columnspan=2, sticky="we", pady=(12, 8)
         )
         ttk.Label(frame, text="パイプライン状態", font=("", 10, "bold")).grid(
-            row=7, column=0, columnspan=2, sticky="w"
+            row=8, column=0, columnspan=2, sticky="w"
         )
 
         # 現在処理中のファイル表示
         self._pipeline_current_var = tk.StringVar(value="待機中")
-        ttk.Label(frame, text="現在:").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(frame, text="現在:").grid(row=9, column=0, sticky="w", pady=(4, 0))
         ttk.Label(
             frame, textvariable=self._pipeline_current_var, foreground="#333"
-        ).grid(row=8, column=1, sticky="w", pady=(4, 0))
+        ).grid(row=9, column=1, sticky="w", pady=(4, 0))
 
         # 直近 24 時間の成功/失敗カウント表示
         self._pipeline_recent_var = tk.StringVar(value="最近の処理: — 件")
         ttk.Label(frame, textvariable=self._pipeline_recent_var, foreground="#555").grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(2, 0)
+            row=10, column=0, columnspan=2, sticky="w", pady=(2, 0)
         )
 
         # 詳細ボタン（直近の処理一覧を Toplevel で表示）
         ttk.Button(
             frame, text="詳細...", command=self._show_pipeline_detail, width=8
-        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -1116,6 +1124,47 @@ class RecordingApp:
             self._start_all_btn.config(state="normal")
         if self._stop_all_btn:
             self._stop_all_btn.config(state="normal")
+
+    # ------------------------------------------------------------------
+    # ノートビューア起動（フェーズ D）
+    # ------------------------------------------------------------------
+
+    def _open_note_viewer(self) -> None:
+        """ノートビューア（note_viewer.py）を別プロセスで起動する。
+
+        既にビューアが起動済みかの判定は行わない（複数ウィンドウが開いても害がないため）。
+        Windows 専用: pythonw.exe を使ってコンソールなしで起動する。
+        """
+        import subprocess
+        viewer_script = PROJECT_ROOT / "scripts" / "note_viewer.py"
+        pythonw = PROJECT_ROOT / ".venv" / "Scripts" / "pythonw.exe"
+
+        if not viewer_script.exists():
+            messagebox.showerror(
+                "エラー",
+                f"ノートビューアスクリプトが見つかりません:\n{viewer_script}",
+            )
+            return
+
+        if not pythonw.exists():
+            messagebox.showerror(
+                "エラー",
+                f"pythonw.exe が見つかりません:\n{pythonw}\n\n"
+                "仮想環境が正しくセットアップされているか確認してください。",
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [str(pythonw), str(viewer_script)],
+                # 親プロセスが終了してもビューアが動き続けるよう、デタッチ起動する
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "起動エラー",
+                f"ノートビューアを起動できませんでした:\n{exc}",
+            )
 
     def _show_pipeline_detail(self) -> None:
         """パイプライン処理の詳細一覧を Toplevel で表示する。
