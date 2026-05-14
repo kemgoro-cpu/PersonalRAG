@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import ollama
+import yaml
 
 from config_loader import PROJECT_ROOT, load_settings, resolve_path
 
@@ -32,6 +33,97 @@ def load_prompt_template() -> str:
     """要約用プロンプトテンプレートを読み込む。"""
     path = PROJECT_ROOT / "config" / "prompts" / "summarize.txt"
     return path.read_text(encoding="utf-8")
+
+
+def load_recording_meta(transcript_path: Path) -> dict[str, str] | None:
+    """transcript と同じディレクトリにある .meta.json を読み込む。
+
+    フェーズ B で record_gui.py が録音時に生成したメタ情報を取得し、
+    Markdown ノートのフロントマターに反映するために使う。
+
+    meta.json のパスは pipeline.py が `{transcript_stem}.meta.json` として
+    transcript 隣に配置しているため、同名ファイルを探すだけでよい。
+
+    Args:
+        transcript_path: 文字起こしファイルのパス。
+
+    Returns:
+        メタ情報辞書。ファイルが存在しない・読み込み失敗の場合は None を返す。
+        キー: "title", "participants", "topic", "recorded_at"
+    """
+    meta_path = transcript_path.parent / (transcript_path.stem + ".meta.json")
+    if not meta_path.exists():
+        return None
+    try:
+        text = meta_path.read_text(encoding="utf-8")
+        data = json.loads(text)
+        # 各フィールドが欠損していても空文字列でフォールバックする
+        return {
+            "title": str(data.get("title", "")),
+            "participants": str(data.get("participants", "")),
+            "topic": str(data.get("topic", "")),
+            "recorded_at": str(data.get("recorded_at", "")),
+        }
+    except Exception as exc:
+        print(f"[warn] meta.json の読み込みに失敗（フロントマターなしで続行）: {exc}", file=sys.stderr)
+        return None
+
+
+def build_recording_frontmatter(meta: dict[str, str]) -> str:
+    """録音メタ情報を YAML フロントマター文字列に変換する。
+
+    PyYAML の safe_dump を使うことで特殊文字を含むタイトルも安全に出力できる。
+    例: タイトルに : や " が含まれる場合も自動的に引用符で囲まれる。
+
+    Args:
+        meta: load_recording_meta() が返した辞書。
+
+    Returns:
+        "---\\n...\\n---\\n" 形式の文字列。
+        全フィールドが空の場合は空文字列を返す（フロントマターを挿入しない）。
+    """
+    # 全フィールドが空の場合はフロントマターを出力しない
+    if not any(meta.values()):
+        return ""
+    # yaml.safe_dump で YAML として valid な出力を生成する
+    # allow_unicode=True: 日本語をエスケープせずそのまま出力
+    # default_flow_style=False: ブロック形式（読みやすい）で出力
+    # sort_keys=False: dict の定義順を維持する
+    yaml_body = yaml.safe_dump(meta, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    return f"---\n{yaml_body}---\n"
+
+
+def merge_frontmatter(
+    recording_meta: dict[str, str] | None,
+    base_meta: dict[str, Any],
+) -> dict[str, Any]:
+    """録音メタと既存メタを1つの dict にマージする。
+
+    キーが衝突した場合は base_meta（生成時メタ）の値を優先する。
+    録音メタの recorded_at と既存メタの date は別キーなので衝突しない。
+
+    優先順位の根拠:
+        - title/participants/topic/recorded_at は録音前にユーザーが入力した値
+        - source/date/generated_at/keywords は LLM 処理で生成した値
+        - どちらが「正」かは用途次第だが、生成時に確定する date/keywords は
+          上書きしたくないため base_meta を優先とする
+
+    Args:
+        recording_meta: load_recording_meta() の戻り値。None なら空辞書として扱う。
+        base_meta: source/date/generated_at/keywords など既存メタを格納した辞書。
+
+    Returns:
+        マージ後の辞書。キー順序: 録音メタ → 既存メタ の順（sort_keys=False で維持）。
+    """
+    merged: dict[str, Any] = {}
+    # 録音メタを先に入れる（後から上書きされる可能性あり）
+    if recording_meta is not None:
+        for k, v in recording_meta.items():
+            if v:  # 空文字列キーは混入させない
+                merged[k] = v
+    # 既存メタで上書き（base_meta のキーが優先）
+    merged.update(base_meta)
+    return merged
 
 
 def call_ollama(
@@ -93,16 +185,24 @@ def render_markdown(
     parsed: dict[str, Any] | None,
     raw_response: str,
     source_transcript: Path,
+    recording_meta: dict[str, str] | None = None,
 ) -> str:
     """LLM 応答を Markdown 形式に整形する。
 
     JSON パースに成功した場合は構造化された Markdown を生成。
     失敗した場合は生応答をそのまま本文に貼り付ける（情報を失わない）。
 
+    フェーズ B: recording_meta が渡された場合は、録音メタ情報
+    （title/participants/topic/recorded_at）と既存メタ（source/date/generated_at/keywords）を
+    1 つの YAML ブロックに統合する。2 ブロックに分けると ingest_db.py の
+    strip_frontmatter が最初の 1 ブロックしか剥がさないため、2 つ目が本文扱いになる回帰を防ぐ。
+    全録音メタフィールドが空の場合は既存メタのみのフロントマターを出力する（既存動作を維持）。
+
     Args:
         parsed: パース済み辞書。None なら failure 時。
         raw_response: LLM の生応答。
         source_transcript: 元の文字起こしファイルパス。
+        recording_meta: 録音前に入力したメタ情報。None なら挿入しない。
 
     Returns:
         Markdown 文字列。
@@ -112,15 +212,23 @@ def render_markdown(
 
     if parsed is None:
         # フォールバック: 生応答をそのまま貼り付け
+        # base_meta を組み立てて録音メタとマージしてから1ブロックで出力する
+        base_meta: dict[str, Any] = {
+            "source": source_transcript.name,
+            "date": today,
+            "generated_at": now,
+            "parse_status": "failed",
+        }
+        merged_meta = merge_frontmatter(recording_meta, base_meta)
+        yaml_body = yaml.safe_dump(
+            merged_meta, allow_unicode=True, default_flow_style=False, sort_keys=False
+        )
+        unified_frontmatter = f"---\n{yaml_body}---\n"
         return (
-            f"---\n"
-            f"source: {source_transcript.name}\n"
-            f"date: {today}\n"
-            f"generated_at: {now}\n"
-            f"parse_status: failed\n"
-            f"---\n\n"
-            f"# 要約（JSON パース失敗、生応答）\n\n"
-            f"```\n{raw_response.strip()}\n```\n"
+            unified_frontmatter
+            + "\n"
+            + "# 要約（JSON パース失敗、生応答）\n\n"
+            + f"```\n{raw_response.strip()}\n```\n"
         )
 
     summary = parsed.get("summary", "")
@@ -130,16 +238,23 @@ def render_markdown(
     questions = parsed.get("questions", []) or []
     keywords = parsed.get("keywords", []) or []
 
-    # フロントマター（Open WebUI / Obsidian / 全文検索用にメタ情報を保持）
-    frontmatter = [
-        "---",
-        f"source: {source_transcript.name}",
-        f"date: {today}",
-        f"generated_at: {now}",
-        f"keywords: [{', '.join(keywords)}]",
-        "---",
-        "",
-    ]
+    # フロントマター用の既存メタ辞書
+    # keywords は YAML リスト形式で出力したいため list のまま渡す
+    # （yaml.safe_dump が自動的にブロックリストに変換する）
+    existing_meta: dict[str, Any] = {
+        "source": source_transcript.name,
+        "date": today,
+        "generated_at": now,
+        "keywords": keywords,
+    }
+
+    # 録音メタと既存メタを1つの辞書にマージしてから YAML 化する
+    # → フロントマターは必ず1ブロックになる（ingest_db.py の strip_frontmatter と整合）
+    merged = merge_frontmatter(recording_meta, existing_meta)
+    yaml_body = yaml.safe_dump(
+        merged, allow_unicode=True, default_flow_style=False, sort_keys=False
+    )
+    unified_frontmatter = f"---\n{yaml_body}---\n\n"
 
     body: list[str] = []
     body.append(f"# 要約 ({today})\n")
@@ -183,7 +298,7 @@ def render_markdown(
         body.append(" / ".join(f"`{k}`" for k in keywords))
         body.append("")
 
-    return "\n".join(frontmatter + body) + "\n"
+    return unified_frontmatter + "\n".join(body) + "\n"
 
 
 def build_output_path(transcript_path: Path, notes_dir: Path) -> Path:
@@ -238,9 +353,17 @@ def main() -> int:
         print("[error] LLM から空応答が返りました。", file=sys.stderr)
         return 4
 
+    # 録音前に入力したメタ情報を読み込む（フェーズ B）
+    # transcript と同名の .meta.json が存在すれば Markdown 先頭にフロントマターを挿入する
+    recording_meta = load_recording_meta(transcript_path)
+    if recording_meta:
+        print(f"[meta] 録音メタ情報を読み込みました: title={recording_meta.get('title', '')}")
+    else:
+        print("[meta] meta.json が見つからないため、フロントマターなしで処理します")
+
     # JSON 抽出 → Markdown 化
     parsed = extract_json(raw_response)
-    markdown = render_markdown(parsed, raw_response, transcript_path)
+    markdown = render_markdown(parsed, raw_response, transcript_path, recording_meta=recording_meta)
 
     output_path = build_output_path(transcript_path, notes_dir)
     output_path.write_text(markdown, encoding="utf-8")

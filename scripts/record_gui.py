@@ -9,7 +9,9 @@ scripts/record_mic.py の CLI 版と同じ Recorder クラス（scripts/recorder
     - グローバルホットキー (デフォルト Ctrl+Alt+R) でウィンドウ非アクティブでも操作可
     - タスクトレイ常駐アイコン (グレー=待機 / 赤=録音中)、メニューから操作・終了
     - マイクデバイス選択プルダウン (停止中のみ操作可)
-    - 5秒間連続で無音を検知したらステータス赤字表示 + 一度だけ通知ダイアログ
+    - 録音開始前にタイトル・参加者・テーマを入力するメモダイアログ
+    - タイトルをファイル名とサイドカー meta.json に反映する
+    - 10秒間連続で無音を検知したらステータス赤字表示 + 一度だけ通知ダイアログ
     - 保存先は config/settings.yaml の paths.recordings_dir (NAS の UNC パス可)
 
 スレッド構成:
@@ -26,10 +28,10 @@ from __future__ import annotations
 
 import enum
 import json
+import logging
 import os
 import queue
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,21 @@ import sounddevice as sd
 
 from config_loader import load_settings, resolve_path, PROJECT_ROOT
 from recorder import Recorder
+
+# GUI に依存しない純粋な関数は recording_meta.py に切り出してある。
+# record_gui.py はそこから import して使う。
+# テストは recording_meta.py を直接 import するため、ここに複製する必要はない。
+from recording_meta import (
+    sanitize_title,
+    load_title_history,
+    save_title_history,
+    add_title_to_history,
+    save_meta_json,
+    HISTORY_MAX,
+)
+
+# ロガー（pythonw 起動時は stdout が無いため、ファイル出力を使う）
+logger = logging.getLogger(__name__)
 
 
 # --- 外部ライブラリ (任意機能): 未インストールでも GUI 本体は起動できるようにする ---
@@ -113,6 +130,14 @@ class RecordingApp:
         self.silence_announced: bool = False          # 通知ダイアログの重複抑止
         self.current_output: Path | None = None       # 直近の保存先パス
         self.device_index_map: list[int | None] = []  # Combobox の表示順 → device index
+
+        # --- 録音前メモ（フェーズ B）---
+        # 直近の録音に紐付いたメタ情報（ダイアログで入力した内容）
+        self._current_meta_title: str = ""
+        self._current_meta_participants: str = ""
+        self._current_meta_topic: str = ""
+        # タイトル履歴（最大 5 件、最新が先頭）
+        self._title_history: list[str] = load_title_history()
 
         # --- 画像（pystray 利用可能時のみ生成） ---
         self._gray_image: Any = self._make_icon_image("gray") if Image else None
@@ -388,16 +413,149 @@ class RecordingApp:
         else:
             self._stop_recording()
 
+    # ------------------------------------------------------------------
+    # 録音前メモダイアログ（フェーズ B）
+    # ------------------------------------------------------------------
+
+    def _show_pre_recording_dialog(self) -> dict[str, str] | None:
+        """録音開始前のメモ入力ダイアログを表示する。
+
+        ユーザーは「録音開始」「メモなしで開始」「キャンセル」の 3 択で操作する。
+        ダイアログは grab_set() でモーダルになる（他のウィンドウを操作不可にする）。
+
+        Returns:
+            「録音開始」または「メモなしで開始」が押されたら dict を返す。
+            キャンセルまたは × ボタンで閉じたら None を返す。
+            dict のキー: "title", "participants", "topic"
+        """
+        # 現在の履歴を読み込む
+        history = self._title_history
+
+        # Toplevel でモーダルダイアログを作成
+        dialog = tk.Toplevel(self.root)
+        dialog.title("録音情報の入力（任意）")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)  # 親ウィンドウに関連付ける
+
+        # 結果を格納する変数（None = キャンセル）
+        result: dict[str, str] | None = None
+
+        # --- ウィジェット構築 ---
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        # タイトル（Combobox: 過去履歴がプルダウンに、自由入力も可）
+        ttk.Label(frame, text="タイトル:").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        title_var = tk.StringVar()
+        title_combo = ttk.Combobox(
+            frame,
+            textvariable=title_var,
+            values=history,
+            width=40,
+        )
+        title_combo.grid(row=0, column=1, sticky="we", pady=(0, 4))
+
+        # 参加者
+        ttk.Label(frame, text="参加者:").grid(row=1, column=0, sticky="w", pady=(0, 4))
+        participants_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=participants_var, width=42).grid(
+            row=1, column=1, sticky="we", pady=(0, 4)
+        )
+
+        # テーマ
+        ttk.Label(frame, text="テーマ:").grid(row=2, column=0, sticky="w", pady=(0, 12))
+        topic_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=topic_var, width=42).grid(
+            row=2, column=1, sticky="we", pady=(0, 12)
+        )
+
+        frame.columnconfigure(1, weight=1)
+
+        # --- ボタン ---
+        button_frame = ttk.Frame(dialog, padding=(16, 0, 16, 16))
+        button_frame.pack(fill="x")
+
+        def _on_start_with_meta() -> None:
+            """「録音開始」ボタン: メタ情報を保存して録音を開始する。"""
+            nonlocal result
+            title = title_var.get().strip()
+            result = {
+                "title": title,
+                "participants": participants_var.get().strip(),
+                "topic": topic_var.get().strip(),
+            }
+            # 空でないタイトルを履歴に追加・保存
+            if title:
+                self._title_history = add_title_to_history(title, self._title_history)
+                save_title_history(self._title_history)
+            dialog.destroy()
+
+        def _on_start_without_meta() -> None:
+            """「メモなしで開始」ボタン: メタ情報なしで即録音する。"""
+            nonlocal result
+            result = {"title": "", "participants": "", "topic": ""}
+            dialog.destroy()
+
+        def _on_cancel() -> None:
+            """キャンセルまたは × ボタン: 録音せずに閉じる。"""
+            nonlocal result
+            result = None
+            dialog.destroy()
+
+        ttk.Button(
+            button_frame, text="録音開始", command=_on_start_with_meta, width=14
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            button_frame, text="メモなしで開始", command=_on_start_without_meta, width=14
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            button_frame, text="キャンセル", command=_on_cancel, width=10
+        ).pack(side="right")
+
+        # × ボタンはキャンセルと同じ動作
+        dialog.protocol("WM_DELETE_WINDOW", _on_cancel)
+
+        # タイトル入力欄にフォーカスを当てる
+        title_combo.focus_set()
+
+        # モーダル化: 他のウィンドウを操作不可にする
+        dialog.grab_set()
+
+        # ダイアログが閉じるまで待つ
+        self.root.wait_window(dialog)
+
+        return result
+
     def _start_recording(self) -> None:
-        """録音開始処理。"""
+        """録音開始処理。まずメモダイアログを表示し、入力内容を取得してから録音を開始する。"""
         # 選択中のデバイスを取得
         idx = self.device_combobox.current()
         if idx < 0 or idx >= len(self.device_index_map):
             idx = 0
         self.selected_device = self.device_index_map[idx]
 
-        # ファイル名とフォルダ作成
-        filename = f"rec_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.wav"
+        # --- 録音前メモダイアログを表示 ---
+        # ダイアログが「キャンセル」または「×」で閉じられた場合は録音しない
+        meta = self._show_pre_recording_dialog()
+        if meta is None:
+            # キャンセル: 何もしない
+            return
+
+        # ダイアログで入力されたメタ情報を保持しておく（後で meta.json に保存する）
+        self._current_meta_title = meta["title"]
+        self._current_meta_participants = meta["participants"]
+        self._current_meta_topic = meta["topic"]
+
+        # --- ファイル名の組み立て ---
+        # タイトルがある場合: rec_2026-05-15_143022_サニタイズ済みタイトル.wav
+        # タイトルが空の場合: rec_2026-05-15_143022.wav
+        timestamp_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        sanitized = sanitize_title(self._current_meta_title)
+        if sanitized:
+            filename = f"rec_{timestamp_str}_{sanitized}.wav"
+        else:
+            filename = f"rec_{timestamp_str}.wav"
+
         output_path = self.recordings_dir / filename
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -431,7 +589,7 @@ class RecordingApp:
             self.tray_icon.title = "PersonalRAG 録音中"
 
     def _stop_recording(self) -> None:
-        """録音停止処理。"""
+        """録音停止処理。meta.json 保存と無音削除ロジックを含む。"""
         # 停止前に「この録音で一度でも音声を検知したか」を確認しておく。
         # stop() 後は次の start() で内部状態がリセットされるため、停止前に取る。
         voice_detected = self.recorder.was_voice_detected()
@@ -453,19 +611,37 @@ class RecordingApp:
             # そもそも保存先パスが取れていない（録音開始前の異常停止など）
             self.status_var.set("待機中")
         elif not voice_detected:
-            # 一度も音声を検知していないので WAV を削除する
-            # pipeline.py が空っぽのファイルに無駄な文字起こしを走らせるのを防ぐ
+            # 一度も音声を検知していないので WAV を削除する。
+            # pipeline.py が空っぽのファイルに無駄な文字起こしを走らせるのを防ぐ。
             try:
                 saved.unlink(missing_ok=True)
             except Exception:
                 # 削除失敗（ファイルロック中など）は致命的ではないので握りつぶす
                 pass
+            # WAV を削除したら隣の meta.json も削除する（ゴミを残さない）
+            meta_path = saved.parent / (saved.stem + ".meta.json")
+            try:
+                meta_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             self.status_var.set(f"無音のため削除しました: {saved.name}")
             self.path_var.set(str(self.recordings_dir))
             tray_title = "PersonalRAG 録音（無音破棄）"
         else:
+            # 音声を検知した有効な録音: meta.json を保存してから完了表示
+            save_meta_json(
+                saved,
+                title=self._current_meta_title,
+                participants=self._current_meta_participants,
+                topic=self._current_meta_topic,
+            )
             self.status_var.set(f"保存しました: {saved.name}")
             self.path_var.set(str(saved))
+
+        # メタ情報をリセット（次の録音セッションに引き継がない）
+        self._current_meta_title = ""
+        self._current_meta_participants = ""
+        self._current_meta_topic = ""
 
         if self.tray_icon is not None and self._gray_image is not None:
             self.tray_icon.icon = self._gray_image

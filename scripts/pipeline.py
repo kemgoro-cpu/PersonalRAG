@@ -292,6 +292,19 @@ def process_audio(
         return
     logger.info(f"transcript: {transcript_path.name}")
 
+    # --- meta.json の引き継ぎ ---
+    # WAV の隣にある .meta.json を transcript と同じ stem で transcripts/ にコピーする。
+    # これにより summarize.py は transcript_stem.meta.json を探すだけで済む。
+    wav_meta_path = audio_path.parent / (audio_path.stem + ".meta.json")
+    if wav_meta_path.exists():
+        transcript_meta_path = transcript_path.parent / (transcript_path.stem + ".meta.json")
+        try:
+            shutil.copy2(str(wav_meta_path), str(transcript_meta_path))
+            logger.info(f"meta.json を transcript 隣にコピー: {transcript_meta_path.name}")
+        except Exception as e:
+            # meta.json の引き継ぎ失敗は警告だけ（summarize はフォールバックで続行）
+            logger.warning(f"meta.json のコピーに失敗（要約は続行）: {e}")
+
     # --- 状態ファイル: summarize ステップへ切替 ---
     if state_file is not None:
         write_state(
@@ -379,6 +392,16 @@ def process_audio(
         logger.info(f"退避: {audio_path.name} → {dest.relative_to(PROJECT_ROOT)}")
     except Exception as e:
         logger.error(f"退避失敗: {e}")
+
+    # WAV の隣にある .meta.json も processed/ に一緒に移動する
+    wav_meta = audio_path.parent / (audio_path.stem + ".meta.json")
+    if wav_meta.exists():
+        try:
+            meta_dest = processed_dir / wav_meta.name
+            shutil.move(str(wav_meta), str(meta_dest))
+            logger.info(f"meta.json 退避: {wav_meta.name} → processed/")
+        except Exception as e:
+            logger.warning(f"meta.json の退避失敗（処理は継続）: {e}")
 
     # --- 状態ファイル: 処理完了を記録 ---
     if state_file is not None:
