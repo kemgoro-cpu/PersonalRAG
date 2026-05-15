@@ -9,6 +9,7 @@ PersonalRAG の設定ファイル（config/settings.yaml）と環境変数（.en
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,84 @@ def load_settings() -> dict[str, Any]:
         )
     with settings_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def update_settings_path(key_path: list[str], value: str) -> None:
+    """config/settings.yaml の指定キーを更新して書き戻す。
+
+    コメントは YAML に保存されないため、書き戻し後にコメントは失われる。
+    書き戻し前に settings.yaml.bak を作成する（既存の .bak は上書き）。
+    書き戻し失敗時は .bak から自動復元する。
+
+    使用例:
+        update_settings_path(["paths", "recordings_dir"], "Z:\\\\PersonalRAG\\\\input")
+
+    Args:
+        key_path: 更新するキーのパス。例: ["paths", "recordings_dir"]
+        value:    新しい値（文字列）。
+
+    Raises:
+        FileNotFoundError: settings.yaml が存在しない場合。
+        ValueError: key_path が空、または指定のキー階層が存在しない（dict でない）場合。
+        OSError: ファイル書き込みに失敗した場合（.bak から復元済み）。
+    """
+    if not key_path:
+        raise ValueError("key_path は 1 要素以上必要です")
+
+    settings_path = PROJECT_ROOT / "config" / "settings.yaml"
+    bak_path = settings_path.with_suffix(".yaml.bak")
+
+    if not settings_path.exists():
+        raise FileNotFoundError(
+            f"設定ファイルが見つかりません: {settings_path}"
+        )
+
+    # --- 1. バックアップ作成 ---
+    shutil.copy2(settings_path, bak_path)
+
+    # --- 2. 現在の設定を読み込む ---
+    with settings_path.open("r", encoding="utf-8") as f:
+        data: dict[str, Any] = yaml.safe_load(f) or {}
+
+    # --- 3. 指定キーを更新 ---
+    # key_path = ["paths", "recordings_dir"] なら data["paths"]["recordings_dir"] を更新する
+    node = data
+    for key in key_path[:-1]:
+        # 途中のキーが存在しない、または dict でない場合はエラー
+        if key not in node or not isinstance(node[key], dict):
+            raise ValueError(
+                f"settings.yaml にキー '{key}' が存在しないか、dict ではありません "
+                f"（key_path={key_path}）"
+            )
+        node = node[key]
+
+    final_key = key_path[-1]
+    node[final_key] = value
+
+    # --- 4. 書き戻す ---
+    # allow_unicode=True: 日本語パスをエスケープせずそのまま書く
+    # sort_keys=False:    元のキー順を保持する
+    # default_flow_style=False: ブロックスタイルで読みやすく書く
+    new_content = yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    )
+
+    try:
+        with settings_path.open("w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError as exc:
+        # 書き込み失敗 → バックアップから復元してエラーを再送出
+        try:
+            shutil.copy2(bak_path, settings_path)
+        except Exception:
+            pass  # 復元失敗時は元の OSError だけを報告する
+        raise OSError(
+            f"settings.yaml の書き込みに失敗しました: {exc}\n"
+            f"バックアップから復元しました: {bak_path}"
+        ) from exc
 
 
 def load_env() -> None:

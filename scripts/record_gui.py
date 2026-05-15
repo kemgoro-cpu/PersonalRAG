@@ -47,11 +47,11 @@ from pathlib import Path
 from typing import Any
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import sounddevice as sd
 
-from config_loader import load_settings, resolve_path, PROJECT_ROOT
+from config_loader import load_settings, resolve_path, update_settings_path, PROJECT_ROOT
 from recorder import Recorder
 from service_manager import ServiceManager, ServiceInfo, ServiceStatus
 
@@ -257,12 +257,19 @@ class RecordingApp:
         self.status_label = ttk.Label(frame, textvariable=self.status_var, font=("", 11))
         self.status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
-        # 保存先パス（小さく表示）
+        # 保存先パス（小さく表示）＋「📁 変更...」ボタン
         ttk.Label(frame, text="保存先:", foreground="#666").grid(row=4, column=0, sticky="w")
         self.path_var = tk.StringVar(value=str(self.recordings_dir))
         ttk.Label(frame, textvariable=self.path_var, foreground="#666").grid(
             row=4, column=1, sticky="w"
         )
+        # 「📁 変更...」ボタン: フォルダ選択ダイアログで録音保存先を変更する
+        ttk.Button(
+            frame,
+            text="📁 変更...",
+            command=self._on_change_recordings_dir,
+            width=10,
+        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
         # 「ノートを開く」ボタン（フェーズ D: ノートビューアを起動）
         ttk.Button(
@@ -270,7 +277,7 @@ class RecordingApp:
             text="📖 ノートを開く",
             command=self._open_note_viewer,
             width=18,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=1, sticky="w", pady=(4, 0))
 
         # ホットキー表示
         ttk.Label(
@@ -285,15 +292,17 @@ class RecordingApp:
             row=7, column=0, columnspan=2, sticky="we", pady=(12, 8)
         )
         ttk.Label(frame, text="パイプライン状態", font=("", 10, "bold")).grid(
-            row=8, column=0, columnspan=2, sticky="w"
+            row=8, column=0, columnspan=2, sticky="w", pady=(0, 2)
         )
 
         # 現在処理中のファイル表示
+        # _pipeline_current_label: _update_pipeline_status() から foreground を変更するために保持
         self._pipeline_current_var = tk.StringVar(value="待機中")
         ttk.Label(frame, text="現在:").grid(row=9, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(
+        self._pipeline_current_label = ttk.Label(
             frame, textvariable=self._pipeline_current_var, foreground="#333"
-        ).grid(row=9, column=1, sticky="w", pady=(4, 0))
+        )
+        self._pipeline_current_label.grid(row=9, column=1, sticky="w", pady=(4, 0))
 
         # 直近 24 時間の成功/失敗カウント表示
         self._pipeline_recent_var = tk.StringVar(value="最近の処理: — 件")
@@ -844,19 +853,65 @@ class RecordingApp:
     def _update_pipeline_status(self) -> None:
         """pipeline_state.json を読んでパイプライン状態 UI を更新する。
 
-        ファイルが存在しない・JSON パース失敗の場合は「待機中」にフォールバックする。
-        ファイル I/O は try/except で握って GUI を止めない。
+        updated_at が現在時刻から 30 秒以内 → Pipeline 稼働中と判定する。
+        30 秒超 / ファイル不在 / パース失敗 → 「Pipeline 停止中」を赤字で表示する。
+
+        service_manager.check_pipeline() と同じ 30 秒しきい値を採用。
+        将来的に PIPELINE_FRESH_THRESHOLD_SECONDS として共通定数化できるが、
+        最小実装として record_gui.py 内で固定値 30 を使う。
         """
+        # Pipeline 稼働判定のしきい値（秒）: service_manager.check_pipeline() と同値
+        PIPELINE_FRESH_THRESHOLD_SECONDS = 30
+
         try:
             if not self._pipeline_state_file.exists():
-                self._pipeline_current_var.set("待機中（pipeline 未起動）")
-                self._pipeline_recent_var.set("最近の処理: — 件")
+                # ファイルがない → Pipeline 未起動
+                self._pipeline_current_var.set("Pipeline 停止中（状態ファイルなし）")
+                self._pipeline_current_label.config(foreground="#cc0000")
+                self._pipeline_recent_var.set("最近の処理: —")
                 return
 
             text = self._pipeline_state_file.read_text(encoding="utf-8")
             data = json.loads(text)
 
-            # 現在処理中の表示
+            # --- updated_at で Pipeline の死活を判定 ---
+            updated_at_str: str = data.get("updated_at", "")
+            pipeline_alive = False
+            diff_seconds = None
+
+            if updated_at_str:
+                try:
+                    updated_at = datetime.fromisoformat(updated_at_str)
+                    if updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    now_utc = datetime.now(timezone.utc)
+                    diff_seconds = (now_utc - updated_at).total_seconds()
+                    pipeline_alive = diff_seconds <= PIPELINE_FRESH_THRESHOLD_SECONDS
+                except Exception:
+                    # updated_at のパース失敗 → 停止とみなす
+                    pipeline_alive = False
+
+            if not pipeline_alive:
+                # 停止中の表示（赤系で目立たせる）
+                if diff_seconds is not None:
+                    self._pipeline_current_var.set(
+                        f"Pipeline 停止中（最終更新 {int(diff_seconds)}s 前）"
+                    )
+                else:
+                    self._pipeline_current_var.set("Pipeline 停止中（更新時刻不明）")
+                self._pipeline_current_label.config(foreground="#cc0000")
+                # 停止中でも recent は読めるなら表示する
+                recent = data.get("recent", [])
+                if recent:
+                    self._update_pipeline_recent_count(recent)
+                else:
+                    self._pipeline_recent_var.set("最近の処理: —")
+                return
+
+            # --- Pipeline 稼働中 ---
+            self._pipeline_current_label.config(foreground="#333")
+
+            # 現在処理中のファイルを表示
             current = data.get("current")
             if current:
                 step_label = {
@@ -868,42 +923,93 @@ class RecordingApp:
                     f"{current.get('file', '')}  ({step_label})"
                 )
             else:
-                self._pipeline_current_var.set("待機中")
+                self._pipeline_current_var.set("待機中（pipeline 稼働中）")
 
             # 直近 24 時間の成功/失敗カウント
             recent = data.get("recent", [])
-            now_ts = datetime.now(timezone.utc)
-            success_count = 0
-            fail_count = 0
-            for entry in recent:
-                finished_at_str = entry.get("finished_at", "")
-                try:
-                    # ISO8601 文字列をパース（Python 3.7+ は fromisoformat 対応）
-                    finished_at = datetime.fromisoformat(finished_at_str)
-                    # タイムゾーン情報がない場合は UTC とみなす
-                    if finished_at.tzinfo is None:
-                        finished_at = finished_at.replace(tzinfo=timezone.utc)
-                    diff_hours = (now_ts - finished_at).total_seconds() / 3600
-                    if diff_hours <= 24:
-                        if entry.get("result") == "success":
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                except Exception:
-                    pass  # パース失敗のエントリは無視
-
-            self._pipeline_recent_var.set(
-                f"最近の処理（直近 24h）: ✓ {success_count} 件 / ✗ {fail_count} 件"
-            )
+            self._update_pipeline_recent_count(recent)
 
         except Exception:
             # ファイル読み込み失敗・JSON 壊れ等は全て無視してフォールバック
-            self._pipeline_current_var.set("待機中")
-            self._pipeline_recent_var.set("最近の処理: — 件（状態ファイル読み込み失敗）")
+            self._pipeline_current_var.set("Pipeline 停止中（状態ファイル読み込み失敗）")
+            self._pipeline_current_label.config(foreground="#cc0000")
+            self._pipeline_recent_var.set("最近の処理: — （読み込み失敗）")
+
+    def _update_pipeline_recent_count(self, recent: list) -> None:
+        """直近 24 時間の成功/失敗件数を集計して _pipeline_recent_var を更新する。
+
+        Args:
+            recent: pipeline_state.json の "recent" リスト
+        """
+        now_ts = datetime.now(timezone.utc)
+        success_count = 0
+        fail_count = 0
+        for entry in recent:
+            finished_at_str = entry.get("finished_at", "")
+            try:
+                # ISO8601 文字列をパース
+                finished_at = datetime.fromisoformat(finished_at_str)
+                if finished_at.tzinfo is None:
+                    finished_at = finished_at.replace(tzinfo=timezone.utc)
+                diff_hours = (now_ts - finished_at).total_seconds() / 3600
+                if diff_hours <= 24:
+                    if entry.get("result") == "success":
+                        success_count += 1
+                    else:
+                        fail_count += 1
+            except Exception:
+                pass  # パース失敗のエントリは無視
+        self._pipeline_recent_var.set(
+            f"最近の処理（直近 24h）: ✓ {success_count} 件 / ✗ {fail_count} 件"
+        )
 
     # ------------------------------------------------------------------
     # サービス管理タブの表示更新とボタン操作
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _create_tooltip(widget: Any, text: str) -> None:
+        """ウィジェットにマウスホバー tooltip を付与する。
+
+        tkinter には標準 tooltip がないため、<Enter> / <Leave> イベントで
+        Toplevel ウィンドウを出し入れする簡易実装。
+
+        Args:
+            widget: tooltip を付けたいウィジェット
+            text:   tooltip に表示する文字列
+        """
+        tooltip_win: list[tk.Toplevel | None] = [None]  # クロージャで状態共有
+
+        def _show(event: Any) -> None:
+            """マウスが widget に乗ったとき: tooltip を表示する。"""
+            if tooltip_win[0] is not None:
+                return  # 既に表示中なら何もしない
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)   # タイトルバーを消す
+            tip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+            tip.attributes("-topmost", True)
+            label = tk.Label(
+                tip,
+                text=text,
+                justify="left",
+                background="#ffffcc",
+                relief="solid",
+                borderwidth=1,
+                font=("", 9),
+                padx=6,
+                pady=4,
+            )
+            label.pack()
+            tooltip_win[0] = tip
+
+        def _hide(event: Any) -> None:
+            """マウスが widget から離れたとき: tooltip を閉じる。"""
+            if tooltip_win[0] is not None:
+                tooltip_win[0].destroy()
+                tooltip_win[0] = None
+
+        widget.bind("<Enter>", _show)
+        widget.bind("<Leave>", _hide)
 
     def _update_service_tab(self, cache: dict[str, ServiceInfo]) -> None:
         """サービス管理タブの各行ウィジェットをキャッシュの内容で更新する。
@@ -934,8 +1040,14 @@ class RecordingApp:
                 if managed:
                     btn.config(text="停止", state="normal")
                 else:
-                    # 外部で起動されたサービスは停止ボタンをグレーアウト
-                    btn.config(text="停止不可", state="disabled")
+                    # 外部で起動されたサービスは停止ボタンをグレーアウト＆tooltip で説明
+                    # 「停止不可」→「外部起動」に変更してわかりやすくする
+                    btn.config(text="外部起動", state="disabled")
+                    self._create_tooltip(
+                        btn,
+                        "この GUI から起動したプロセスではないため停止できません。\n"
+                        "タスクマネージャから手動で停止してください。",
+                    )
             else:
                 # 停止中: グレーのインジケータ
                 status_label.config(text="○ 停止中", foreground="#888")
@@ -1166,6 +1278,108 @@ class RecordingApp:
                 "起動エラー",
                 f"ノートビューアを起動できませんでした:\n{exc}",
             )
+
+    def _on_change_recordings_dir(self) -> None:
+        """「📁 変更...」ボタン: フォルダ選択ダイアログで録音保存先を変更する。
+
+        選択されたパスを settings.yaml の paths.recordings_dir に書き戻す。
+        書き戻し後は GUI の再起動を促す（即時反映はしない）。
+
+        安全策:
+            - 書き戻し前に settings.yaml.bak を自動作成
+            - コメント消失を事前に警告
+            - 書き戻し失敗時は .bak から自動復元
+            - 同じパスが選択された場合は何もしない
+        """
+        # --- フォルダ選択ダイアログ ---
+        initial_dir = str(self.recordings_dir) if self.recordings_dir.exists() else str(PROJECT_ROOT)
+        chosen = filedialog.askdirectory(
+            title="録音保存先フォルダを選択",
+            initialdir=initial_dir,
+            mustexist=False,  # 存在しないフォルダも選択可能（後でチェックする）
+        )
+        if not chosen:
+            # キャンセル or ダイアログを × で閉じた
+            return
+
+        # --- パスオブジェクトに変換 ---
+        chosen_path = Path(chosen)
+
+        # 同じパスが選択された場合は何もしない（バックアップも作らない）
+        try:
+            if chosen_path.resolve() == self.recordings_dir.resolve():
+                return
+        except Exception:
+            pass  # resolve() 失敗（ネットワークパス等）は無視して続行
+
+        # --- パスの存在チェック ---
+        if not chosen_path.exists():
+            # フォルダが存在しない場合は作成を確認する
+            should_create = messagebox.askyesno(
+                "フォルダ作成の確認",
+                f"フォルダが存在しません:\n{chosen_path}\n\n作成しますか？",
+            )
+            if should_create:
+                try:
+                    chosen_path.mkdir(parents=True, exist_ok=True)
+                except Exception as exc:
+                    messagebox.showerror(
+                        "フォルダ作成エラー",
+                        f"フォルダを作成できませんでした:\n{exc}",
+                    )
+                    return
+            else:
+                return
+
+        # ネットワークパス（UNC: \\server\share）の疎通確認
+        chosen_str = str(chosen_path)
+        if chosen_str.startswith("\\\\") or chosen_str.startswith("//"):
+            try:
+                # 疎通確認: パスが列挙できるか試みる（タイムアウトなし → 数秒かかる場合あり）
+                list(chosen_path.iterdir())
+            except Exception as exc:
+                # 警告を出すが、保存は許可する（NAS が一時的に落ちている可能性もあるため）
+                should_continue = messagebox.askyesno(
+                    "ネットワークパスの警告",
+                    f"ネットワークパスにアクセスできませんでした:\n{exc}\n\n"
+                    "このまま保存先として設定しますか？\n"
+                    "（NAS が起動していないと録音を保存できません）",
+                )
+                if not should_continue:
+                    return
+
+        # --- コメント消失の警告 + 書き戻し確認 ---
+        should_write = messagebox.askyesno(
+            "settings.yaml の書き換え確認",
+            f"録音保存先を以下のパスに変更します:\n\n{chosen_path}\n\n"
+            "【注意】settings.yaml のコメントは書き戻し後に消えます。\n"
+            "変更前のファイルは settings.yaml.bak に保存されます。\n\n"
+            "続行しますか？",
+        )
+        if not should_write:
+            return
+
+        # --- settings.yaml に書き戻す ---
+        # Windows パスは区切り文字を統一して保存（YAML に書くのでスラッシュ or バックスラッシュどちらでも動く）
+        save_value = chosen_str
+
+        try:
+            update_settings_path(["paths", "recordings_dir"], save_value)
+        except Exception as exc:
+            messagebox.showerror(
+                "設定保存エラー",
+                f"settings.yaml の書き込みに失敗しました:\n{exc}\n\n"
+                "settings.yaml.bak が存在する場合はそこから手動で復元できます。",
+            )
+            return
+
+        # --- 変更完了 → 再起動を促す ---
+        messagebox.showinfo(
+            "保存先を変更しました",
+            f"録音保存先を変更しました:\n{chosen_path}\n\n"
+            "変更を反映するには GUI を再起動してください。\n"
+            "（現在のセッション中は元のフォルダに保存されます）",
+        )
 
     def _show_pipeline_detail(self) -> None:
         """パイプライン処理の詳細一覧を Toplevel で表示する。
