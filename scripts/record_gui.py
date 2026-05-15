@@ -1011,6 +1011,27 @@ class RecordingApp:
         widget.bind("<Enter>", _show)
         widget.bind("<Leave>", _hide)
 
+    @staticmethod
+    def _set_tooltip(widget: Any, text: str) -> None:
+        """tooltip を安全に付け替えるラッパー。
+
+        毎回 <Enter> / <Leave> の binding を unbind してからセットし直すことで、
+        状態遷移後に古い tooltip が残留する問題を防ぐ。
+        text が空文字の場合は binding を外すだけで tooltip を付けない。
+
+        注意: <Enter> / <Leave> のみを操作し、クリック等の他の binding は維持する。
+
+        Args:
+            widget: tooltip を設定したいウィジェット
+            text:   tooltip に表示する文字列。空文字を渡すと tooltip を削除する。
+        """
+        # 既存の Enter/Leave binding を解除（他の binding は維持）
+        widget.unbind("<Enter>")
+        widget.unbind("<Leave>")
+        # text が指定されている場合のみ新規 binding を付ける
+        if text:
+            RecordingApp._create_tooltip(widget, text)
+
     def _update_service_tab(self, cache: dict[str, ServiceInfo]) -> None:
         """サービス管理タブの各行ウィジェットをキャッシュの内容で更新する。
 
@@ -1039,11 +1060,14 @@ class RecordingApp:
                 managed = name in self.service_manager._processes
                 if managed:
                     btn.config(text="停止", state="normal")
+                    # 「停止」状態では tooltip 不要 → 既存 binding を外す
+                    self._set_tooltip(btn, "")
                 else:
                     # 外部で起動されたサービスは停止ボタンをグレーアウト＆tooltip で説明
                     # 「停止不可」→「外部起動」に変更してわかりやすくする
                     btn.config(text="外部起動", state="disabled")
-                    self._create_tooltip(
+                    # _set_tooltip を使うことで状態遷移時に古い binding を確実に外す
+                    self._set_tooltip(
                         btn,
                         "この GUI から起動したプロセスではないため停止できません。\n"
                         "タスクマネージャから手動で停止してください。",
@@ -1053,6 +1077,8 @@ class RecordingApp:
                 status_label.config(text="○ 停止中", foreground="#888")
                 detail_label.config(text=info.detail, foreground="#aaa")
                 btn.config(text="起動", state="normal")
+                # 「起動」状態では tooltip 不要 → 既存 binding を外す
+                self._set_tooltip(btn, "")
 
     def _on_service_button(self, name: str) -> None:
         """サービス行の個別ボタン（「起動」または「停止」）が押されたときの処理。

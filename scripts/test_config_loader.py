@@ -159,6 +159,42 @@ def test_invalid_key_path() -> None:
     print("テスト 5 PASS: 存在しないキー階層で ValueError が送出される")
 
 
+def test_final_key_missing_raises_error() -> None:
+    """テスト 6: 異常系 - 最終キーが存在しない場合は ValueError が送出される（allow_create デフォルト）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        _make_temp_settings(tmp_dir)
+
+        raised = False
+        try:
+            # "typo_key" は settings.yaml の paths セクションに存在しないキー
+            update_settings_path(["paths", "typo_key"], "/new/path")
+        except ValueError:
+            raised = True
+
+        assert raised, "ValueError が送出されるべきだった"
+    print("テスト 6 PASS: 最終キー未存在で ValueError が送出される")
+
+
+def test_final_key_missing_allow_create() -> None:
+    """テスト 7: 正常系 - allow_create=True なら最終キーが存在しなくても新規作成できる。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        _, settings_path = _make_temp_settings(tmp_dir)
+
+        # allow_create=True で存在しないキーに値を書き込む
+        update_settings_path(["paths", "new_key"], "/added/path", allow_create=True)
+
+        with settings_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        assert data["paths"]["new_key"] == "/added/path", (
+            f"期待値: '/added/path', 実際: {data['paths'].get('new_key')}"
+        )
+        # 既存キーが壊れていないことも確認する
+        assert data["paths"]["recordings_dir"] == "data/recordings"
+    print("テスト 7 PASS: allow_create=True で最終キー未存在でも新規作成できる")
+
+
 def run_all_tests() -> None:
     """全テストを実行する。1 つでも失敗したら AssertionError で停止する。"""
     print("=== config_loader.update_settings_path 単体テスト ===")
@@ -167,6 +203,8 @@ def run_all_tests() -> None:
     test_deep_nested_key()
     test_file_not_found()
     test_invalid_key_path()
+    test_final_key_missing_raises_error()
+    test_final_key_missing_allow_create()
     print("\n全テスト PASS")
 
 

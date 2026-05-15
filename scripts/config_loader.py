@@ -37,7 +37,9 @@ def load_settings() -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def update_settings_path(key_path: list[str], value: str) -> None:
+def update_settings_path(
+    key_path: list[str], value: str, allow_create: bool = False
+) -> None:
     """config/settings.yaml の指定キーを更新して書き戻す。
 
     コメントは YAML に保存されないため、書き戻し後にコメントは失われる。
@@ -48,12 +50,15 @@ def update_settings_path(key_path: list[str], value: str) -> None:
         update_settings_path(["paths", "recordings_dir"], "Z:\\\\PersonalRAG\\\\input")
 
     Args:
-        key_path: 更新するキーのパス。例: ["paths", "recordings_dir"]
-        value:    新しい値（文字列）。
+        key_path:     更新するキーのパス。例: ["paths", "recordings_dir"]
+        value:        新しい値（文字列）。
+        allow_create: True にすると最終キーが存在しない場合でも新規作成する。
+                      デフォルト False（存在しないキーへの typo 混入を防ぐため）。
 
     Raises:
         FileNotFoundError: settings.yaml が存在しない場合。
-        ValueError: key_path が空、または指定のキー階層が存在しない（dict でない）場合。
+        ValueError: key_path が空、指定のキー階層が存在しない（dict でない）場合、
+                    または allow_create=False かつ最終キーが存在しない場合。
         OSError: ファイル書き込みに失敗した場合（.bak から復元済み）。
     """
     if not key_path:
@@ -87,6 +92,14 @@ def update_settings_path(key_path: list[str], value: str) -> None:
         node = node[key]
 
     final_key = key_path[-1]
+    # allow_create=False（デフォルト）のとき、最終キーが存在しなければ ValueError
+    # → typo や誤ったキー名での silent な新規作成を防ぐ
+    if final_key not in node and not allow_create:
+        raise ValueError(
+            f"settings.yaml に最終キー '{final_key}' が存在しません "
+            f"（key_path={key_path}）。"
+            " 新規キーを追加したい場合は allow_create=True を指定してください。"
+        )
     node[final_key] = value
 
     # --- 4. 書き戻す ---
