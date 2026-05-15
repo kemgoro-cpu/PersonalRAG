@@ -131,9 +131,14 @@ class RecordingApp:
             pipeline_cfg.get("failed_files_log", "data/logs/failed_files.json")
         )
         # 入力フォルダ内の failed/ サブフォルダパス（隔離先）
-        self._input_failed_dir: Path = resolve_path(
-            settings["paths"]["input_dir"]
-        ) / "failed"
+        # 音声とテキストで別々のフォルダを管理する:
+        #   audio: data/input/failed/
+        #   text:  data/input_text/failed/
+        # failed_files.json のエントリの source_type で振り分ける
+        self._failed_dirs: dict[str, Path] = {
+            "audio": resolve_path(settings["paths"]["input_dir"]) / "failed",
+            "text": resolve_path(settings["paths"]["input_text_dir"]) / "failed",
+        }
         # 最後に失敗件数を読んだ時刻（5 秒スロットリング用）
         self._failed_count_last_read: float = 0.0
         # 現在の隔離済みファイル件数（ボタンラベルに表示）
@@ -1545,18 +1550,25 @@ class RecordingApp:
             tree.column(col, width=width, anchor="w")
 
         # データを挿入（最新順: moved_at 降順で表示）
+        # iid は「インデックスベース」(str(idx)) にする。同名ファイルが履歴に複数
+        # ある場合に filename 固定だと ID 衝突するため。実体エントリは
+        # entry_map[iid] = entry の dict で参照する。
         sorted_history = sorted(
             history,
             key=lambda e: e.get("moved_at", ""),
             reverse=True,
         )
-        for entry in sorted_history:
+        # iid → entry dict のマッピング。各操作で iid からエントリを引く
+        entry_map: dict[str, dict] = {}
+        for idx, entry in enumerate(sorted_history):
+            iid = str(idx)
+            entry_map[iid] = entry
             filename = entry.get("file", "?")
             moved_at = entry.get("moved_at", "")[:19].replace("T", " ")
             errors = entry.get("errors", [])
             fail_count = len(errors)
             last_error = errors[-1] if errors else "—"
-            tree.insert("", "end", iid=filename, values=(filename, moved_at, fail_count, last_error))
+            tree.insert("", "end", iid=iid, values=(filename, moved_at, fail_count, last_error))
 
         scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
@@ -1567,18 +1579,50 @@ class RecordingApp:
         btn_frame = ttk.Frame(dialog, padding=(8, 0, 8, 8))
         btn_frame.pack(fill="x", side="bottom")
 
-        def _get_selected_entry() -> dict | None:
-            """Treeview で選択中の行の失敗エントリを返す。未選択なら None。"""
+        def _get_selected() -> tuple[str, dict] | None:
+            """Treeview で選択中の行の (iid, entry) を返す。未選択なら None。"""
             selected = tree.selection()
             if not selected:
                 messagebox.showinfo("操作", "ファイルを選択してください。", parent=dialog)
                 return None
             iid = selected[0]
-            # history から該当エントリを探す
-            for entry in history:
-                if entry.get("file") == iid:
-                    return entry
-            return None
+            entry = entry_map.get(iid)
+            if entry is None:
+                return None
+            return iid, entry
+
+        def _resolve_entry_path(entry: dict) -> tuple[Path, Path] | None:
+            """failed_files.json のエントリから (実ファイル絶対パス, 入力フォルダ) を返す。
+
+            優先順位:
+              1. moved_to（フルパスの相対表記、新しいエントリで保証）
+              2. moved_to_name（リネーム後ファイル名、新しいエントリで保証）
+              3. file（元のファイル名、古いエントリのフォールバック）
+
+            source_type が無い古いエントリは拡張子から推測する。
+            """
+            # source_type を取得（古いエントリは拡張子から推測）
+            source_type = entry.get("source_type")
+            if source_type not in ("audio", "text"):
+                ext = Path(entry.get("file", "")).suffix.lower()
+                audio_exts = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+                source_type = "audio" if ext in audio_exts else "text"
+
+            failed_dir = self._failed_dirs.get(source_type)
+            if failed_dir is None:
+                return None
+            input_dir = failed_dir.parent  # 親が data/input または data/input_text
+
+            # 優先順位 1: moved_to（プロジェクトルートからの相対パス）
+            moved_to = entry.get("moved_to")
+            if moved_to:
+                # Windows / Unix どちらの区切り文字でも解決できるよう Path に変換
+                full_path = (PROJECT_ROOT / moved_to).resolve()
+                return full_path, input_dir
+
+            # 優先順位 2 & 3: moved_to_name → file
+            name = entry.get("moved_to_name") or entry.get("file", "")
+            return failed_dir / name, input_dir
 
         def _save_history(new_history: list[dict]) -> None:
             """更新した failed_files.json を保存してボタンラベルを更新する。"""
@@ -1595,27 +1639,42 @@ class RecordingApp:
                 self._failed_files_btn.config(text=label, state=state)
 
         def _on_retry() -> None:
-            """「再試行」ボタン: failed/ から data/input/ に戻して再処理を促す。"""
-            entry = _get_selected_entry()
-            if entry is None:
+            """「再試行」ボタン: failed/ から元の入力フォルダに戻して再処理を促す。"""
+            # nonlocal は関数冒頭で 1 回だけ宣言する（Python の構文制約）
+            nonlocal history
+            sel = _get_selected()
+            if sel is None:
                 return
+            iid, entry = sel
 
-            filename = entry.get("file", "")
-            failed_path = self._input_failed_dir / filename
-            input_dir = self._input_failed_dir.parent  # data/input/
+            resolved = _resolve_entry_path(entry)
+            if resolved is None:
+                messagebox.showerror(
+                    "再試行",
+                    "このエントリのファイル種別を判定できませんでした。",
+                    parent=dialog,
+                )
+                return
+            failed_path, input_dir = resolved
 
             # ファイルが failed/ に存在するか確認
             if not failed_path.exists():
                 messagebox.showwarning(
                     "再試行",
                     f"隔離先にファイルが見つかりません:\n{failed_path}\n\n"
-                    "既に手動で移動・削除された可能性があります。",
+                    "既に手動で移動・削除された可能性があります。\n"
+                    "履歴のみ削除します。",
                     parent=dialog,
                 )
+                # 履歴掃除（ファイルがないので戻すものはない）
+                history = [e for e in history if e is not entry]
+                entry_map.pop(iid, None)
+                _save_history(history)
+                tree.delete(iid)
                 return
 
-            # data/input/ に移動
-            dest = input_dir / filename
+            # 元の入力フォルダに移動（リネーム後の実ファイル名でそのまま戻す）
+            dest = input_dir / failed_path.name
             try:
                 import shutil as _shutil
                 _shutil.move(str(failed_path), str(dest))
@@ -1623,8 +1682,8 @@ class RecordingApp:
                 messagebox.showerror("再試行失敗", f"ファイルを戻せませんでした:\n{exc}", parent=dialog)
                 return
 
-            # .meta.json も戻す
-            meta_failed = self._input_failed_dir / (Path(filename).stem + ".meta.json")
+            # .meta.json も戻す（隔離先に並んでいた場合のみ）
+            meta_failed = failed_path.parent / (failed_path.stem + ".meta.json")
             if meta_failed.exists():
                 try:
                     import shutil as _shutil
@@ -1635,43 +1694,50 @@ class RecordingApp:
             # retry_count.json からエントリを削除（次回処理は 0 からカウント）
             try:
                 from retry_tracker import load_retry_state, save_retry_state
-                from config_loader import load_settings, resolve_path as _resolve
                 _settings = load_settings()
-                _rcf = _resolve(
+                _rcf = resolve_path(
                     _settings.get("pipeline", {}).get(
                         "retry_count_file", "data/logs/retry_count.json"
                     )
                 )
                 state = load_retry_state(_rcf)
-                if filename in state:
-                    del state[filename]
-                    save_retry_state(_rcf, state, logger)
+                # 元のファイル名と隔離後ファイル名の両方をクリア（用心深く）
+                for name in {entry.get("file", ""), failed_path.name}:
+                    if name and name in state:
+                        del state[name]
+                save_retry_state(_rcf, state, logger)
             except Exception as exc:
                 logger.warning(f"retry_count.json のクリア失敗（処理は継続）: {exc}")
 
-            # failed_files.json からエントリを削除
-            nonlocal history
-            history = [e for e in history if e.get("file") != filename]
+            # failed_files.json から該当エントリを削除
+            history = [e for e in history if e is not entry]
+            entry_map.pop(iid, None)
             _save_history(history)
-
-            # Treeview から行を削除
-            tree.delete(filename)
+            tree.delete(iid)
 
             messagebox.showinfo(
                 "再試行",
-                f"{filename} を data/input/ に戻しました。\n"
+                f"{failed_path.name} を {input_dir.name}/ に戻しました。\n"
                 "pipeline.py が次のタイミングで自動処理を開始します。",
                 parent=dialog,
             )
 
         def _on_delete() -> None:
             """「削除」ボタン: 確認後に物理削除し、failed_files.json からエントリを削除する。"""
-            entry = _get_selected_entry()
-            if entry is None:
+            sel = _get_selected()
+            if sel is None:
                 return
+            iid, entry = sel
 
-            filename = entry.get("file", "")
-            failed_path = self._input_failed_dir / filename
+            resolved = _resolve_entry_path(entry)
+            if resolved is None:
+                messagebox.showerror(
+                    "削除",
+                    "このエントリのファイル種別を判定できませんでした。",
+                    parent=dialog,
+                )
+                return
+            failed_path, _input_dir = resolved
 
             # 削除確認ダイアログ
             confirmed = messagebox.askyesno(
@@ -1684,35 +1750,66 @@ class RecordingApp:
             if not confirmed:
                 return
 
-            # 物理削除
-            try:
-                failed_path.unlink(missing_ok=True)
-            except Exception as exc:
-                messagebox.showerror("削除失敗", f"ファイルを削除できませんでした:\n{exc}", parent=dialog)
-                return
-
-            # .meta.json も削除する
-            meta_path = self._input_failed_dir / (Path(filename).stem + ".meta.json")
-            try:
-                meta_path.unlink(missing_ok=True)
-            except Exception:
-                pass  # meta.json の削除失敗は致命的でない
+            # ファイル存在チェック → 物理削除（unlink は missing_ok=False、デフォルト）
+            # missing_ok=True で「対象パスがズレていても成功扱い」になり実体ファイルが
+            # 孤立する事故を防ぐため、存在を確認した上で unlink する。
+            file_existed = failed_path.exists()
+            if file_existed:
+                try:
+                    failed_path.unlink()  # missing_ok=False（デフォルト）
+                except Exception as exc:
+                    messagebox.showerror(
+                        "削除失敗", f"ファイルを削除できませんでした:\n{exc}", parent=dialog
+                    )
+                    return
+                # .meta.json も削除する（存在チェック付き）
+                meta_path = failed_path.parent / (failed_path.stem + ".meta.json")
+                if meta_path.exists():
+                    try:
+                        meta_path.unlink()
+                    except Exception:
+                        pass  # meta.json の削除失敗は致命的でない
+            else:
+                # ファイルが見つからない: 履歴のみ削除する
+                messagebox.showwarning(
+                    "ファイルなし",
+                    f"対象ファイルが見つかりません:\n{failed_path}\n\n"
+                    "既に手動で削除されているか、パスがズレている可能性があります。\n"
+                    "履歴からのみ削除します。",
+                    parent=dialog,
+                )
 
             # failed_files.json からエントリを削除
             nonlocal history
-            history = [e for e in history if e.get("file") != filename]
+            history = [e for e in history if e is not entry]
+            entry_map.pop(iid, None)
             _save_history(history)
+            tree.delete(iid)
 
-            # Treeview から行を削除
-            tree.delete(filename)
-
-            messagebox.showinfo("削除完了", f"{filename} を削除しました。", parent=dialog)
+            if file_existed:
+                messagebox.showinfo("削除完了", f"{failed_path.name} を削除しました。", parent=dialog)
 
         def _on_open_folder() -> None:
-            """「エクスプローラで開く」ボタン: failed/ フォルダをエクスプローラで開く。"""
+            """「エクスプローラで開く」ボタン: failed/ フォルダをエクスプローラで開く。
+
+            選択行があれば、その source_type に応じた failed/ フォルダを開く。
+            未選択時は音声側 (data/input/failed) をデフォルトで開く。
+            """
+            target_dir: Path | None = None
+            sel = tree.selection()
+            if sel:
+                entry = entry_map.get(sel[0])
+                if entry is not None:
+                    resolved = _resolve_entry_path(entry)
+                    if resolved is not None:
+                        # resolved の failed_path は実ファイル。親が failed/ フォルダ
+                        target_dir = resolved[0].parent
+            if target_dir is None:
+                target_dir = self._failed_dirs["audio"]
+
             try:
-                self._input_failed_dir.mkdir(parents=True, exist_ok=True)
-                os.startfile(str(self._input_failed_dir))
+                target_dir.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(target_dir))
             except Exception as exc:
                 messagebox.showerror(
                     "エクスプローラ起動失敗",

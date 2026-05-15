@@ -502,10 +502,16 @@ def process_audio(
             # failed_files.json に永続的な失敗記録として追記
             # errors には retry_count.json のエントリが持つ全エラー回数分の履歴を入れる
             error_list = [error_msg] * count  # 簡易実装: 同一エラーを count 回分記録
+            # source_type と moved_to_name を追加:
+            # - source_type: GUI が音声/テキストどちらの failed フォルダを参照すべきか判定するため
+            # - moved_to_name: 同名衝突で _001 等にリネームされた後の実ファイル名を保持。
+            #   GUI は moved_to（フルパス）優先、フォールバックで moved_to_name を使う
             append_failed_history(
                 failed_files_log,
                 {
                     "file": audio_path.name,
+                    "source_type": "audio",
+                    "moved_to_name": dest_failed.name,
                     "errors": error_list,
                     "first_failed_at": first_failed_at,
                     "moved_at": _now_iso(),
@@ -885,10 +891,13 @@ def process_text(
             )
             # failed_files.json に永続的な失敗記録として追記
             error_list = [error_msg] * count  # 簡易実装: 同一エラーを count 回分記録
+            # source_type と moved_to_name を追加（音声側と同様の理由、process_audio 参照）
             append_failed_history(
                 failed_files_log,
                 {
                     "file": text_path.name,
+                    "source_type": "text",
+                    "moved_to_name": dest_failed.name,
                     "errors": error_list,
                     "first_failed_at": first_failed_at,
                     "moved_at": _now_iso(),
