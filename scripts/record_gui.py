@@ -928,8 +928,9 @@ class RecordingApp:
                 status_label.config(text="● 稼働中", foreground="green")
                 detail_label.config(text=info.detail, foreground="#333")
                 # ボタンを「停止」に切替（ただしこのGUIが起動していない場合はグレーアウト）
-                with self._service_status_lock:
-                    managed = name in self.service_manager._pids
+                # _processes は ServiceManager 側で内部ロック保護されているため
+                # こちら側の _service_status_lock とは独立。読み取りのみなので 'in' は安全
+                managed = name in self.service_manager._processes
                 if managed:
                     btn.config(text="停止", state="normal")
                 else:
