@@ -1594,10 +1594,18 @@ class RecordingApp:
         def _resolve_entry_path(entry: dict) -> tuple[Path, Path] | None:
             """failed_files.json のエントリから (実ファイル絶対パス, 入力フォルダ) を返す。
 
+            セキュリティ: 最終的に返すパスは必ず self._failed_dirs[source_type] の
+            **配下** に収まるよう検証する。failed_files.json が壊れている or
+            手編集された場合に、failed/ 外の任意パスに対して削除・移動・フォルダ作成が
+            走らないようにするための path traversal 防御。
+
             優先順位:
-              1. moved_to（フルパスの相対表記、新しいエントリで保証）
-              2. moved_to_name（リネーム後ファイル名、新しいエントリで保証）
+              1. moved_to（プロジェクトルートからの相対パス、新しいエントリで保証）
+                 → resolve 後 failed_dir 配下にあるかチェック、外れたら 2 へフォールバック
+              2. moved_to_name（リネーム後ファイル名）
+                 → basename 化してから failed_dir / 名前 で安全に組み立て
               3. file（元のファイル名、古いエントリのフォールバック）
+                 → 同様に basename 化
 
             source_type が無い古いエントリは拡張子から推測する。
             """
@@ -1613,16 +1621,32 @@ class RecordingApp:
                 return None
             input_dir = failed_dir.parent  # 親が data/input または data/input_text
 
-            # 優先順位 1: moved_to（プロジェクトルートからの相対パス）
+            candidate: Path | None = None
+
+            # 優先順位 1: moved_to を試す（ただし failed_dir 配下である検証必須）
             moved_to = entry.get("moved_to")
             if moved_to:
-                # Windows / Unix どちらの区切り文字でも解決できるよう Path に変換
-                full_path = (PROJECT_ROOT / moved_to).resolve()
-                return full_path, input_dir
+                try:
+                    full_path = (PROJECT_ROOT / moved_to).resolve()
+                    # failed_dir も resolve して比較（シンボリックリンク等も実体で見る）
+                    failed_resolved = failed_dir.resolve()
+                    # is_relative_to は Python 3.9+。配下なら採用
+                    if full_path.is_relative_to(failed_resolved):
+                        candidate = full_path
+                    # 配下外なら無視してフォールバックへ
+                except (OSError, ValueError):
+                    pass
 
-            # 優先順位 2 & 3: moved_to_name → file
-            name = entry.get("moved_to_name") or entry.get("file", "")
-            return failed_dir / name, input_dir
+            # 優先順位 2 & 3: moved_to_name → file。basename 化して安全に組み立てる
+            # （basename 化により `..` や絶対パス指定を防ぐ）
+            if candidate is None:
+                raw_name = entry.get("moved_to_name") or entry.get("file", "")
+                safe_name = Path(raw_name).name  # ディレクトリ部分を捨てる
+                if not safe_name:
+                    return None
+                candidate = failed_dir / safe_name
+
+            return candidate, input_dir
 
         def _save_history(new_history: list[dict]) -> None:
             """更新した failed_files.json を保存してボタンラベルを更新する。"""
