@@ -36,6 +36,12 @@ from watchdog.observers import Observer
 
 from config_loader import PROJECT_ROOT, load_settings, resolve_path
 from notify import notify
+from retry_tracker import (
+    increment_retry_count,
+    clear_retry_count,
+    append_failed_history,
+    is_quarantined,
+)
 
 
 def setup_logger(log_dir: Path) -> logging.Logger:
@@ -435,6 +441,90 @@ def process_audio(
     # 設定から通知オプションを取得（デフォルトは有効）
     notify_on_success: bool = settings.get("pipeline", {}).get("notify_on_success", True)
 
+    # --- リトライ管理設定を取得 ---
+    pipeline_cfg = settings.get("pipeline", {})
+    retry_max: int = int(pipeline_cfg.get("retry_max", 3))
+    retry_count_file = resolve_path(
+        pipeline_cfg.get("retry_count_file", "data/logs/retry_count.json")
+    )
+    failed_files_log = resolve_path(
+        pipeline_cfg.get("failed_files_log", "data/logs/failed_files.json")
+    )
+    # failed/ サブフォルダ（隔離先）のパス
+    failed_dir = resolve_path(settings["paths"]["input_dir"]) / "failed"
+
+    def _handle_step_failure(error_msg: str) -> None:
+        """ステップ失敗時の共通処理: リトライカウント加算 → 上限到達で隔離。
+
+        この関数を呼ぶ前に recent への追記と write_state は完了していること。
+
+        Args:
+            error_msg: エラーの内容文字列。
+        """
+        count = increment_retry_count(retry_count_file, audio_path.name, error_msg, logger)
+        if count >= retry_max:
+            # --- リトライ上限到達: failed/ に隔離 ---
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            dest_failed = failed_dir / audio_path.name
+            # 既存ファイルがあれば連番にする
+            if dest_failed.exists():
+                stem, suffix = dest_failed.stem, dest_failed.suffix
+                for n in range(1, 999):
+                    alt = failed_dir / f"{stem}_{n:03d}{suffix}"
+                    if not alt.exists():
+                        dest_failed = alt
+                        break
+            try:
+                shutil.move(str(audio_path), str(dest_failed))
+                logger.warning(
+                    f"リトライ上限 ({retry_max} 回) 到達のため隔離: "
+                    f"{audio_path.name} → {dest_failed.relative_to(PROJECT_ROOT)}"
+                )
+            except Exception as e:
+                logger.error(f"隔離移動失敗: {e}")
+                return
+
+            # .meta.json も一緒に移動する
+            meta_src = audio_path.parent / (audio_path.stem + ".meta.json")
+            if meta_src.exists():
+                try:
+                    shutil.move(str(meta_src), str(failed_dir / meta_src.name))
+                    logger.info(f"meta.json も隔離先に移動: {meta_src.name} → failed/")
+                except Exception as e:
+                    logger.warning(f"meta.json の隔離移動失敗: {e}")
+
+            # retry_count.json から削除（隔離後は追跡不要）
+            from retry_tracker import load_retry_state, save_retry_state
+            state = load_retry_state(retry_count_file)
+            first_failed_at = state.get(audio_path.name, {}).get(
+                "first_failed_at", _now_iso()
+            )
+            # failed_files.json に永続的な失敗記録として追記
+            # errors には retry_count.json のエントリが持つ全エラー回数分の履歴を入れる
+            error_list = [error_msg] * count  # 簡易実装: 同一エラーを count 回分記録
+            append_failed_history(
+                failed_files_log,
+                {
+                    "file": audio_path.name,
+                    "errors": error_list,
+                    "first_failed_at": first_failed_at,
+                    "moved_at": _now_iso(),
+                    "moved_to": str(dest_failed.relative_to(PROJECT_ROOT)).replace("\\", "/"),
+                },
+                logger,
+            )
+            # retry_count.json からエントリを削除
+            if audio_path.name in state:
+                del state[audio_path.name]
+                save_retry_state(retry_count_file, state, logger)
+
+            # トースト通知（warning レベル）
+            notify(
+                "PersonalRAG",
+                f"✗ 連続失敗のため隔離: {audio_path.name}",
+                "warning",
+            )
+
     # 書き込み中ファイルでないことを確認
     if not wait_until_stable(
         audio_path, settings["pipeline"]["stable_wait_seconds"], logger
@@ -449,6 +539,7 @@ def process_audio(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ stable_wait 失敗: {audio_path.name}", "warning")
+        _handle_step_failure("ファイルが安定しないためスキップ")
         return
 
     # Step 1: 文字起こし
@@ -463,6 +554,7 @@ def process_audio(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ transcribe 失敗: {audio_path.name}", "error")
+        _handle_step_failure("transcribe 失敗")
         return
 
     transcript_path = find_latest_transcript(transcripts_dir, audio_path.stem)
@@ -479,6 +571,7 @@ def process_audio(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ transcript なし: {audio_path.name}", "error")
+        _handle_step_failure("transcript ファイルが見つからない")
         return
     logger.info(f"transcript: {transcript_path.name}")
 
@@ -517,6 +610,7 @@ def process_audio(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ summarize 失敗: {audio_path.name}", "error")
+        _handle_step_failure("summarize 失敗")
         return
 
     note_path = find_latest_note(notes_dir, transcript_path.stem)
@@ -531,6 +625,7 @@ def process_audio(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ note なし: {audio_path.name}", "error")
+        _handle_step_failure("note ファイルが見つからない")
         return
     logger.info(f"note: {note_path.name}")
 
@@ -556,6 +651,7 @@ def process_audio(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ ingest_db 失敗: {audio_path.name}", "error")
+        _handle_step_failure("ingest_db 失敗")
         return
 
     # Step 5: Open WebUI Knowledge への自動同期（任意・失敗しても続行）
@@ -603,6 +699,9 @@ def process_audio(
         })
         write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
 
+    # 成功時にリトライカウントをクリア（次回から 0 から再カウント）
+    clear_retry_count(retry_count_file, audio_path.name, logger)
+
     # 成功時のトースト通知（設定で notify_on_success: false にすると抑制できる）
     if notify_on_success:
         notify("PersonalRAG", f"✓ 要約完了: {audio_path.name}", "info")
@@ -647,6 +746,10 @@ class AudioFileHandler(FileSystemEventHandler):
 
         # processed/ サブフォルダの変動は無視
         if "processed" in path.parts:
+            return
+
+        # failed/ サブフォルダの変動は無視（隔離済みファイルを再処理しない）
+        if "failed" in path.parts:
             return
 
         if path.suffix.lower() not in self.watch_extensions:
@@ -722,6 +825,89 @@ def process_text(
     # 設定から通知オプションを取得（デフォルトは有効）
     notify_on_success: bool = settings.get("pipeline", {}).get("notify_on_success", True)
 
+    # --- リトライ管理設定を取得 ---
+    pipeline_cfg = settings.get("pipeline", {})
+    retry_max: int = int(pipeline_cfg.get("retry_max", 3))
+    retry_count_file = resolve_path(
+        pipeline_cfg.get("retry_count_file", "data/logs/retry_count.json")
+    )
+    failed_files_log = resolve_path(
+        pipeline_cfg.get("failed_files_log", "data/logs/failed_files.json")
+    )
+    # failed/ サブフォルダ（隔離先）のパスはテキスト入力フォルダ配下に作る
+    failed_dir = text_path.parent / "failed"
+
+    def _handle_step_failure(error_msg: str) -> None:
+        """ステップ失敗時の共通処理: リトライカウント加算 → 上限到達で隔離。
+
+        この関数を呼ぶ前に recent への追記と write_state は完了していること。
+
+        Args:
+            error_msg: エラーの内容文字列。
+        """
+        count = increment_retry_count(retry_count_file, text_path.name, error_msg, logger)
+        if count >= retry_max:
+            # --- リトライ上限到達: failed/ に隔離 ---
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            dest_failed = failed_dir / text_path.name
+            # 既存ファイルがあれば連番にする
+            if dest_failed.exists():
+                stem, suffix = dest_failed.stem, dest_failed.suffix
+                for n in range(1, 999):
+                    alt = failed_dir / f"{stem}_{n:03d}{suffix}"
+                    if not alt.exists():
+                        dest_failed = alt
+                        break
+            try:
+                shutil.move(str(text_path), str(dest_failed))
+                logger.warning(
+                    f"リトライ上限 ({retry_max} 回) 到達のため隔離: "
+                    f"{text_path.name} → {dest_failed.relative_to(PROJECT_ROOT)}"
+                )
+            except Exception as e:
+                logger.error(f"隔離移動失敗: {e}")
+                return
+
+            # .meta.json も一緒に移動する（テキストファイルには meta.json がない場合が多いが念のため）
+            meta_src = text_path.parent / (text_path.stem + ".meta.json")
+            if meta_src.exists():
+                try:
+                    shutil.move(str(meta_src), str(failed_dir / meta_src.name))
+                    logger.info(f"meta.json も隔離先に移動: {meta_src.name} → failed/")
+                except Exception as e:
+                    logger.warning(f"meta.json の隔離移動失敗: {e}")
+
+            # retry_count.json からエントリを削除（隔離後は追跡不要）
+            from retry_tracker import load_retry_state, save_retry_state
+            state = load_retry_state(retry_count_file)
+            first_failed_at = state.get(text_path.name, {}).get(
+                "first_failed_at", _now_iso()
+            )
+            # failed_files.json に永続的な失敗記録として追記
+            error_list = [error_msg] * count  # 簡易実装: 同一エラーを count 回分記録
+            append_failed_history(
+                failed_files_log,
+                {
+                    "file": text_path.name,
+                    "errors": error_list,
+                    "first_failed_at": first_failed_at,
+                    "moved_at": _now_iso(),
+                    "moved_to": str(dest_failed.relative_to(PROJECT_ROOT)).replace("\\", "/"),
+                },
+                logger,
+            )
+            # retry_count.json からエントリを削除
+            if text_path.name in state:
+                del state[text_path.name]
+                save_retry_state(retry_count_file, state, logger)
+
+            # トースト通知（warning レベル）
+            notify(
+                "PersonalRAG",
+                f"✗ 連続失敗のため隔離: {text_path.name}",
+                "warning",
+            )
+
     # 書き込み中ファイルでないことを確認（コピー中のファイルを誤処理しないため）
     if not wait_until_stable(
         text_path, settings["pipeline"]["stable_wait_seconds"], logger
@@ -736,6 +922,7 @@ def process_text(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ stable_wait 失敗: {text_path.name}", "warning")
+        _handle_step_failure("ファイルが安定しないためスキップ")
         return
 
     # Step 1-alt: テキスト → 正規化 transcript
@@ -750,6 +937,7 @@ def process_text(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ import_transcript 失敗: {text_path.name}", "error")
+        _handle_step_failure("import_transcript 失敗")
         return
 
     # import_transcript.py も transcribe.py と同じ命名規則で出力するため、
@@ -768,6 +956,7 @@ def process_text(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ transcript なし: {text_path.name}", "error")
+        _handle_step_failure("transcript ファイルが見つからない")
         return
     logger.info(f"transcript: {transcript_path.name}")
 
@@ -793,6 +982,7 @@ def process_text(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ summarize 失敗: {text_path.name}", "error")
+        _handle_step_failure("summarize 失敗")
         return
 
     note_path = find_latest_note(notes_dir, transcript_path.stem)
@@ -807,6 +997,7 @@ def process_text(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ note なし: {text_path.name}", "error")
+        _handle_step_failure("note ファイルが見つからない")
         return
     logger.info(f"note: {note_path.name}")
 
@@ -832,6 +1023,7 @@ def process_text(
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
         notify("PersonalRAG", f"✗ ingest_db 失敗: {text_path.name}", "error")
+        _handle_step_failure("ingest_db 失敗")
         return
 
     # Step 5: Open WebUI Knowledge への自動同期（任意・失敗しても続行）
@@ -867,6 +1059,9 @@ def process_text(
             "note_path": str(note_path),
         })
         write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
+
+    # 成功時にリトライカウントをクリア（次回から 0 から再カウント）
+    clear_retry_count(retry_count_file, text_path.name, logger)
 
     # 成功時のトースト通知（設定で notify_on_success: false にすると抑制できる）
     if notify_on_success:
@@ -916,6 +1111,10 @@ class TextFileHandler(FileSystemEventHandler):
 
         # processed/ サブフォルダの変動は無視
         if "processed" in path.parts:
+            return
+
+        # failed/ サブフォルダの変動は無視（隔離済みファイルを再処理しない）
+        if "failed" in path.parts:
             return
 
         if path.suffix.lower() not in self.text_extensions:
@@ -968,7 +1167,11 @@ def process_existing_files(
     candidates = [
         p
         for p in input_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in extensions
+        # 対象拡張子のファイルのみ。processed/ や failed/ サブフォルダ配下は除外する
+        if p.is_file()
+        and p.suffix.lower() in extensions
+        and "processed" not in p.parts
+        and "failed" not in p.parts
     ]
     if not candidates:
         return

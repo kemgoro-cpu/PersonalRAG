@@ -113,6 +113,14 @@ pipeline:
   # 多重起動防止用 lock file のパス（pipeline.py が起動時に作成し、終了時に削除する）
   # 別のパスにしたい場合は絶対パスか PROJECT_ROOT 相対パスを指定する
   lock_file: data/logs/pipeline.lock
+  # --- 失敗ファイル隔離設定 ---
+  # この回数連続失敗したファイルを data/input/failed/ に隔離する
+  # 隔離後は record_gui.py の「失敗一覧」ダイアログから再試行または削除できる
+  retry_max: 3
+  # リトライ回数を記録するファイル（ファイル単位のカウント・一時的な状態）
+  retry_count_file: data/logs/retry_count.json
+  # 隔離済みファイルの永続的な失敗記録（監査ログ）
+  failed_files_log: data/logs/failed_files.json
 
 # --- Step 5: Open WebUI Knowledge 自動同期設定 ---
 openwebui:

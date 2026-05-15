@@ -124,6 +124,23 @@ class RecordingApp:
         # 最後に状態ファイルを読んだ時刻（1 秒スロットリング用）
         self._pipeline_state_last_read: float = 0.0
 
+        # --- 失敗ファイル管理 ---
+        # failed_files.json のパス（pipeline.py が書き出す）
+        pipeline_cfg = settings.get("pipeline", {})
+        self._failed_files_log: Path = resolve_path(
+            pipeline_cfg.get("failed_files_log", "data/logs/failed_files.json")
+        )
+        # 入力フォルダ内の failed/ サブフォルダパス（隔離先）
+        self._input_failed_dir: Path = resolve_path(
+            settings["paths"]["input_dir"]
+        ) / "failed"
+        # 最後に失敗件数を読んだ時刻（5 秒スロットリング用）
+        self._failed_count_last_read: float = 0.0
+        # 現在の隔離済みファイル件数（ボタンラベルに表示）
+        self._failed_count: int = 0
+        # 「失敗一覧」ボタンのウィジェット参照（_update_failed_count_label で更新）
+        self._failed_files_btn: Any = None
+
         # --- 録音エンジン ---
         self.recorder = Recorder(
             sample_rate=int(rec_cfg["sample_rate"]),
@@ -321,7 +338,17 @@ class RecordingApp:
         # 詳細ボタン（直近の処理一覧を Toplevel で表示）
         ttk.Button(
             frame, text="詳細...", command=self._show_pipeline_detail, width=8
-        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=11, column=0, sticky="w", pady=(6, 0))
+
+        # 「失敗一覧」ボタン（隔離済みファイルを一覧・再試行・削除できるダイアログを開く）
+        # 件数は _tick() が 5 秒おきに更新する
+        self._failed_files_btn = ttk.Button(
+            frame,
+            text="失敗一覧 (0)",
+            command=self._show_failed_files_dialog,
+            width=14,
+        )
+        self._failed_files_btn.grid(row=11, column=1, sticky="w", pady=(6, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -583,6 +610,11 @@ class RecordingApp:
         if now - self._pipeline_state_last_read >= 1.0:
             self._pipeline_state_last_read = now
             self._update_pipeline_status()
+
+        # 4-b) 失敗一覧の件数を 5 秒おきに更新してボタンラベルに反映する
+        if now - self._failed_count_last_read >= 5.0:
+            self._failed_count_last_read = now
+            self._update_failed_count_label()
 
         # 5) サービス管理タブの表示更新（ロック取得 → キャッシュ参照 → 即解放）
         #    I/O なし・ロック保持時間は数マイクロ秒なので freeze の心配なし
@@ -1434,6 +1466,272 @@ class RecordingApp:
             f"録音保存先を変更しました:\n{chosen_path}\n\n"
             "変更を反映するには GUI を再起動してください。\n"
             "（現在のセッション中は元のフォルダに保存されます）",
+        )
+
+    def _update_failed_count_label(self) -> None:
+        """failed_files.json を読んで失敗件数を取得し、ボタンラベルを更新する。
+
+        ファイルが存在しない・壊れている場合は 0 件として扱う。
+        件数 0 のときはボタンを非活性、1 件以上のときは赤字で強調する。
+        """
+        if self._failed_files_btn is None:
+            return
+
+        count = 0
+        try:
+            if self._failed_files_log.exists():
+                text = self._failed_files_log.read_text(encoding="utf-8")
+                data = json.loads(text)
+                if isinstance(data, list):
+                    count = len(data)
+        except Exception:
+            # 読み込みエラーは無視して 0 件として扱う
+            count = 0
+
+        self._failed_count = count
+        label = f"失敗一覧 ({count})"
+        if count == 0:
+            # 件数 0: ボタンを無効化（押しても何もない状態なので混乱を防ぐ）
+            self._failed_files_btn.config(text=label, state="disabled")
+        else:
+            # 件数 1 以上: 赤字（foreground は ttk.Button では効かないため state="normal" のみ）
+            self._failed_files_btn.config(text=label, state="normal")
+
+    def _show_failed_files_dialog(self) -> None:
+        """隔離された失敗ファイルの一覧ダイアログを Toplevel で表示する。
+
+        各ファイルに対して「再試行」「削除」「エクスプローラで開く」操作を提供する。
+
+        再試行: failed/ から data/input/ に戻し、retry_count.json / failed_files.json
+                からエントリを削除する → pipeline.py が自動で拾って再処理する。
+        削除:   確認ダイアログ後に物理削除し、failed_files.json からエントリを削除する。
+        エクスプローラで開く: os.startfile(failed_dir) で failed フォルダを開く。
+        """
+        # failed_files.json を読み込む
+        history: list[dict] = []
+        try:
+            if self._failed_files_log.exists():
+                text = self._failed_files_log.read_text(encoding="utf-8")
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    history = parsed
+        except Exception as e:
+            messagebox.showerror("失敗一覧", f"failed_files.json の読み込みに失敗しました:\n{e}")
+            return
+
+        # Toplevel ダイアログを作成
+        dialog = tk.Toplevel(self.root)
+        dialog.title("隔離された失敗ファイル")
+        dialog.geometry("700x400")
+        dialog.transient(self.root)
+
+        # 説明ラベル
+        ttk.Label(
+            dialog,
+            text=(
+                "処理に連続失敗したファイルの一覧です。"
+                "各ファイルを再試行するか、不要なら削除してください。"
+            ),
+            font=("", 9),
+            foreground="#666",
+            padding=(8, 6),
+        ).pack(fill="x")
+
+        # Treeview でファイル一覧を表示
+        columns = ("ファイル名", "隔離日時", "失敗回数", "最後のエラー")
+        tree = ttk.Treeview(dialog, columns=columns, show="headings", height=10)
+        for col, width in zip(columns, [200, 130, 70, 240]):
+            tree.heading(col, text=col)
+            tree.column(col, width=width, anchor="w")
+
+        # データを挿入（最新順: moved_at 降順で表示）
+        sorted_history = sorted(
+            history,
+            key=lambda e: e.get("moved_at", ""),
+            reverse=True,
+        )
+        for entry in sorted_history:
+            filename = entry.get("file", "?")
+            moved_at = entry.get("moved_at", "")[:19].replace("T", " ")
+            errors = entry.get("errors", [])
+            fail_count = len(errors)
+            last_error = errors[-1] if errors else "—"
+            tree.insert("", "end", iid=filename, values=(filename, moved_at, fail_count, last_error))
+
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(4, 8))
+        scrollbar.pack(side="right", fill="y", pady=(4, 8), padx=(0, 8))
+
+        # --- ボタン行 ---
+        btn_frame = ttk.Frame(dialog, padding=(8, 0, 8, 8))
+        btn_frame.pack(fill="x", side="bottom")
+
+        def _get_selected_entry() -> dict | None:
+            """Treeview で選択中の行の失敗エントリを返す。未選択なら None。"""
+            selected = tree.selection()
+            if not selected:
+                messagebox.showinfo("操作", "ファイルを選択してください。", parent=dialog)
+                return None
+            iid = selected[0]
+            # history から該当エントリを探す
+            for entry in history:
+                if entry.get("file") == iid:
+                    return entry
+            return None
+
+        def _save_history(new_history: list[dict]) -> None:
+            """更新した failed_files.json を保存してボタンラベルを更新する。"""
+            try:
+                from retry_tracker import _atomic_write
+                _atomic_write(self._failed_files_log, new_history, logger)
+            except Exception as exc:
+                logger.warning(f"failed_files.json の保存失敗: {exc}")
+            # ボタンラベルを即時更新
+            self._failed_count = len(new_history)
+            label = f"失敗一覧 ({self._failed_count})"
+            if self._failed_files_btn is not None:
+                state = "normal" if self._failed_count > 0 else "disabled"
+                self._failed_files_btn.config(text=label, state=state)
+
+        def _on_retry() -> None:
+            """「再試行」ボタン: failed/ から data/input/ に戻して再処理を促す。"""
+            entry = _get_selected_entry()
+            if entry is None:
+                return
+
+            filename = entry.get("file", "")
+            failed_path = self._input_failed_dir / filename
+            input_dir = self._input_failed_dir.parent  # data/input/
+
+            # ファイルが failed/ に存在するか確認
+            if not failed_path.exists():
+                messagebox.showwarning(
+                    "再試行",
+                    f"隔離先にファイルが見つかりません:\n{failed_path}\n\n"
+                    "既に手動で移動・削除された可能性があります。",
+                    parent=dialog,
+                )
+                return
+
+            # data/input/ に移動
+            dest = input_dir / filename
+            try:
+                import shutil as _shutil
+                _shutil.move(str(failed_path), str(dest))
+            except Exception as exc:
+                messagebox.showerror("再試行失敗", f"ファイルを戻せませんでした:\n{exc}", parent=dialog)
+                return
+
+            # .meta.json も戻す
+            meta_failed = self._input_failed_dir / (Path(filename).stem + ".meta.json")
+            if meta_failed.exists():
+                try:
+                    import shutil as _shutil
+                    _shutil.move(str(meta_failed), str(input_dir / meta_failed.name))
+                except Exception:
+                    pass  # meta.json の移動失敗は致命的でない
+
+            # retry_count.json からエントリを削除（次回処理は 0 からカウント）
+            try:
+                from retry_tracker import load_retry_state, save_retry_state
+                from config_loader import load_settings, resolve_path as _resolve
+                _settings = load_settings()
+                _rcf = _resolve(
+                    _settings.get("pipeline", {}).get(
+                        "retry_count_file", "data/logs/retry_count.json"
+                    )
+                )
+                state = load_retry_state(_rcf)
+                if filename in state:
+                    del state[filename]
+                    save_retry_state(_rcf, state, logger)
+            except Exception as exc:
+                logger.warning(f"retry_count.json のクリア失敗（処理は継続）: {exc}")
+
+            # failed_files.json からエントリを削除
+            nonlocal history
+            history = [e for e in history if e.get("file") != filename]
+            _save_history(history)
+
+            # Treeview から行を削除
+            tree.delete(filename)
+
+            messagebox.showinfo(
+                "再試行",
+                f"{filename} を data/input/ に戻しました。\n"
+                "pipeline.py が次のタイミングで自動処理を開始します。",
+                parent=dialog,
+            )
+
+        def _on_delete() -> None:
+            """「削除」ボタン: 確認後に物理削除し、failed_files.json からエントリを削除する。"""
+            entry = _get_selected_entry()
+            if entry is None:
+                return
+
+            filename = entry.get("file", "")
+            failed_path = self._input_failed_dir / filename
+
+            # 削除確認ダイアログ
+            confirmed = messagebox.askyesno(
+                "削除の確認",
+                f"以下のファイルを完全に削除しますか？\n\n"
+                f"{failed_path}\n\n"
+                "この操作は元に戻せません。",
+                parent=dialog,
+            )
+            if not confirmed:
+                return
+
+            # 物理削除
+            try:
+                failed_path.unlink(missing_ok=True)
+            except Exception as exc:
+                messagebox.showerror("削除失敗", f"ファイルを削除できませんでした:\n{exc}", parent=dialog)
+                return
+
+            # .meta.json も削除する
+            meta_path = self._input_failed_dir / (Path(filename).stem + ".meta.json")
+            try:
+                meta_path.unlink(missing_ok=True)
+            except Exception:
+                pass  # meta.json の削除失敗は致命的でない
+
+            # failed_files.json からエントリを削除
+            nonlocal history
+            history = [e for e in history if e.get("file") != filename]
+            _save_history(history)
+
+            # Treeview から行を削除
+            tree.delete(filename)
+
+            messagebox.showinfo("削除完了", f"{filename} を削除しました。", parent=dialog)
+
+        def _on_open_folder() -> None:
+            """「エクスプローラで開く」ボタン: failed/ フォルダをエクスプローラで開く。"""
+            try:
+                self._input_failed_dir.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(self._input_failed_dir))
+            except Exception as exc:
+                messagebox.showerror(
+                    "エクスプローラ起動失敗",
+                    f"フォルダを開けませんでした:\n{exc}",
+                    parent=dialog,
+                )
+
+        # ボタンを横並びに配置
+        ttk.Button(btn_frame, text="再試行", command=_on_retry, width=10).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(btn_frame, text="削除", command=_on_delete, width=10).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(
+            btn_frame, text="エクスプローラで開く", command=_on_open_folder, width=18
+        ).pack(side="left")
+        ttk.Button(btn_frame, text="閉じる", command=dialog.destroy, width=10).pack(
+            side="right"
         )
 
     def _show_pipeline_detail(self) -> None:
