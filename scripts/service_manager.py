@@ -278,6 +278,12 @@ class ServiceManager:
         pythonw.exe を使うことでコンソールウィンドウを出さずに起動する。
         Popen オブジェクトを self._processes["Pipeline"] に保存する。
 
+        多重起動防止:
+            Popen する前に check_pipeline() で稼働中かどうか確認する。
+            既に RUNNING なら新規 Popen をせずに「稼働中」メッセージを返す。
+            これにより、ボタン連打でプロセスが 7 個並列起動する事故を防ぐ。
+            pipeline.py 自身の lock file 防止（Bug 1 修正）と 2 重に防御する。
+
         Returns:
             (成功フラグ, メッセージ)
         """
@@ -289,6 +295,24 @@ class ServiceManager:
         if not pipeline_script.exists():
             return False, f"pipeline.py が見つかりません: {pipeline_script}"
 
+        # --- 既存稼働チェック（Popen する前に確認） ---
+        # state.json の updated_at が 30 秒以内なら既に別プロセスで動いているとみなす。
+        # Whisper モデルロード直後は heartbeat がまだ走っていないため、
+        # 自分が起動した Popen が生きているかも合わせて確認する。
+        current_info = self.check_pipeline()
+        if current_info.status == ServiceStatus.RUNNING:
+            logger.info("Pipeline は既に稼働中のため新規起動をスキップします")
+            return True, "Pipeline は既に稼働中です"
+
+        # 自分が既に Popen を保持していて、そのプロセスがまだ生きている場合も重複起動しない
+        with self._lock:
+            existing_proc = self._processes.get("Pipeline")
+        if existing_proc is not None and existing_proc.poll() is None:
+            logger.info(
+                f"Pipeline Popen が既に存在します (PID={existing_proc.pid})。新規起動をスキップします"
+            )
+            return True, f"Pipeline は既に起動中です（PID={existing_proc.pid}）"
+
         try:
             proc = subprocess.Popen(
                 [str(pythonw), str(pipeline_script)],
@@ -299,6 +323,15 @@ class ServiceManager:
             with self._lock:
                 self._processes["Pipeline"] = proc
             logger.info(f"Pipeline 起動: PID={proc.pid}")
+
+            # 0.5 秒待って即死していないか確認する（lock file 競合で exit 1 する場合の検知）
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                with self._lock:
+                    self._processes.pop("Pipeline", None)
+                logger.warning(f"Pipeline PID={proc.pid} が即終了: 多重起動ガードが発動した可能性")
+                return False, "Pipeline の起動に失敗しました（多重起動ガードにより即終了した可能性があります）"
+
             return True, f"Pipeline を起動しました（PID={proc.pid}）"
 
         except Exception as exc:

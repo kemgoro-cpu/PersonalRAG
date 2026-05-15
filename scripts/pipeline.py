@@ -66,6 +66,153 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
+def _atomic_replace(
+    tmp_file: Path,
+    target: Path,
+    logger: logging.Logger,
+    max_retries: int = 5,
+) -> bool:
+    """一時ファイルを target にアトミックリネームする。PermissionError 時はリトライする。
+
+    Windows では os.replace() が WinError 32（ファイルロック衝突）を
+    PermissionError として投げることがある。複数プロセスが state.json を
+    同時に読み書きすると発生しうるため、0.1 秒待ってリトライする。
+
+    Args:
+        tmp_file: リネーム元の一時ファイル。
+        target:   リネーム先の最終パス。
+        logger:   ロガー。
+        max_retries: 最大リトライ回数（デフォルト 5 回、合計 0.5 秒待つ）。
+
+    Returns:
+        成功なら True。最大リトライ回数を超えたら False（警告ログ出力済み）。
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            os.replace(tmp_file, target)
+            return True
+        except PermissionError as e:
+            # WinError 32: ほかのプロセスがファイルを使用中
+            logger.warning(
+                f"アトミック書き込みリトライ {attempt}/{max_retries}: {e}"
+            )
+            time.sleep(0.1)
+        except OSError as e:
+            # WinError 32 は OSError のサブクラスとして来ることもある
+            if "[WinError 32]" in str(e) or getattr(e, "winerror", None) == 32:
+                logger.warning(
+                    f"アトミック書き込みリトライ {attempt}/{max_retries}: {e}"
+                )
+                time.sleep(0.1)
+            else:
+                # それ以外の OSError はリトライしない
+                logger.warning(f"アトミック書き込み失敗（OSError）: {e}")
+                return False
+    # max_retries 回失敗したら諦める（次の write_state で回復する）
+    logger.warning(
+        f"アトミック書き込みを {max_retries} 回試みたが失敗しました。"
+        f"state.json の整合性は次の書き込みで回復します。"
+    )
+    return False
+
+
+def _is_pid_running(pid: int) -> bool:
+    """指定 PID のプロセスが生存しているか確認する（Windows 専用）。
+
+    tasklist コマンドで確認する。psutil を使わず標準ライブラリのみで実装。
+    PID が存在していても権限エラー等で確認できない場合は「生存中」として扱う。
+
+    Args:
+        pid: 確認するプロセス ID。
+
+    Returns:
+        生存中なら True、確実に死んでいるなら False。
+    """
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        # tasklist が PID を見つけると stdout に数字が含まれる
+        # 見つからないと "情報: 指定した基準に一致するタスクは実行されていません。" が返る
+        return str(pid) in result.stdout
+    except Exception:
+        # 確認できない場合は「生存中かもしれない」として True を返す（安全側）
+        return True
+
+
+def acquire_lock(lock_file: Path, logger: logging.Logger) -> bool:
+    """lock file を取得する。既に起動中なら False を返して終了を促す。
+
+    ロックファイルの設計:
+        - 内容: 自プロセスの PID（整数）のみ
+        - 起動時: lock file が存在すれば PID を読んで生存確認
+            - 生存中 → 「既に起動しています」とエラー出力して False を返す
+            - 死亡（前回異常終了の残骸）→ lock file を上書きして起動継続
+            - 読み取り失敗 → 安全側として上書きして継続
+
+    Args:
+        lock_file: ロックファイルのパス。
+        logger:    ロガー。
+
+    Returns:
+        起動してよければ True、既に動いているなら False。
+    """
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if lock_file.exists():
+        try:
+            existing_pid = int(lock_file.read_text(encoding="utf-8").strip())
+            if _is_pid_running(existing_pid):
+                # 別の pipeline.py が生存中 → 多重起動を拒否
+                print(
+                    f"pipeline.py は既に起動しています (PID: {existing_pid})。"
+                    f"多重起動を防ぐため終了します。",
+                    file=sys.stderr,
+                )
+                logger.error(
+                    f"多重起動を検知: pipeline.py PID={existing_pid} が既に実行中"
+                )
+                return False
+            else:
+                # 前回異常終了の残骸 → 上書きして起動継続
+                logger.warning(
+                    f"古い lock file を検知 (PID={existing_pid} は既に終了済み)。"
+                    f"lock file を上書きして起動します。"
+                )
+        except (ValueError, OSError) as e:
+            # lock file が壊れている・読めない → 安全側として上書き継続
+            logger.warning(f"lock file の読み込み失敗（上書きして起動します）: {e}")
+
+    # lock file に自プロセスの PID を書き込む
+    try:
+        lock_file.write_text(str(os.getpid()), encoding="utf-8")
+        logger.info(f"lock file 作成: {lock_file} (PID={os.getpid()})")
+        return True
+    except OSError as e:
+        # lock file が書けない（ディスクフル等）でも起動は継続する（警告のみ）
+        logger.warning(f"lock file の作成に失敗しました（起動は継続）: {e}")
+        return True
+
+
+def release_lock(lock_file: Path, logger: logging.Logger) -> None:
+    """lock file を削除する。終了時（finally 節）に呼ぶ。
+
+    Args:
+        lock_file: 削除するロックファイルのパス。
+        logger:    ロガー。
+    """
+    try:
+        if lock_file.exists():
+            lock_file.unlink()
+            logger.info(f"lock file を削除しました: {lock_file}")
+    except OSError as e:
+        logger.warning(f"lock file の削除に失敗しました: {e}")
+
+
 def write_state(
     state_file: Path,
     current: dict[str, Any] | None,
@@ -108,7 +255,8 @@ def write_state(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        os.replace(tmp_file, state_file)
+        # PermissionError (WinError 32) をリトライで吸収する
+        _atomic_replace(tmp_file, state_file, logger)
     except Exception as e:
         # ディスクフル・権限エラー等は warning だけ出して続行
         logger.warning(f"状態ファイルの書き込み失敗（処理は継続します）: {e}")
@@ -147,7 +295,8 @@ def touch_state(state_file: Path, logger: logging.Logger) -> None:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        os.replace(tmp_file, state_file)
+        # PermissionError (WinError 32) をリトライで吸収する
+        _atomic_replace(tmp_file, state_file, logger)
     except Exception as e:
         # heartbeat の失敗は警告だけ出して続行（pipeline 本処理は止めない）
         logger.warning(f"heartbeat の状態ファイル更新失敗（処理は継続します）: {e}")
@@ -852,6 +1001,18 @@ def main() -> int:
     text_input_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logger(log_dir)
+
+    # --- 多重起動防止: lock file チェック（Observer 起動より前に実行） ---
+    # pipeline.py が 7 個並列で起動してしまう事故の根本対策。
+    # lock_file のパスは settings で変更可能（デフォルト data/logs/pipeline.lock）。
+    lock_file_rel: str = settings.get("pipeline", {}).get(
+        "lock_file", "data/logs/pipeline.lock"
+    )
+    lock_file = resolve_path(lock_file_rel)
+    if not acquire_lock(lock_file, logger):
+        # 既に起動中 → exit code 1 で終了（service_manager 側でも検知可能）
+        return 1
+
     logger.info(f"音声フォルダ監視を開始: {input_dir}")
     logger.info(f"テキスト監視も開始: {text_input_dir}")
     logger.info("Ctrl+C で終了します。")
@@ -931,6 +1092,8 @@ def main() -> int:
         # KeyboardInterrupt / SystemExit どちらの場合も heartbeat を停止する
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=heartbeat_interval + 5)
+        # lock file を削除（次回起動時に残骸として残らないように）
+        release_lock(lock_file, logger)
 
     observer.join()
     return 0
