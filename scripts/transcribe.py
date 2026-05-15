@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -253,7 +254,24 @@ def write_transcript(
         else:
             lines.append(f"{ts} {seg['text']}")
 
-    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # --- アトミック書き込み ---
+    # pipeline.py が Ctrl+C / taskkill で停止された場合、中途半端な .txt が
+    # data/transcripts/ に残ると、次回処理で find_latest_transcript が
+    # 不完全ファイルを掴むリスクがある。
+    # そこで *.tmp に全文を書き終わってから os.replace で本ファイルに昇格させる。
+    # 起動時クリーンアップ（pipeline.py main 冒頭）で残った *.tmp は全削除される。
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp_path, output_path)
+    except Exception:
+        # 失敗時は中途半端な tmp を残さない（起動時クリーンアップでも消えるが念のため）
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     print(f"[output] 保存しました: {output_path}")
 
 

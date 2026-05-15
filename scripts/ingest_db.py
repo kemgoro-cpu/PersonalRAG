@@ -120,6 +120,20 @@ def ingest_file(
 ) -> int:
     """単一の Markdown ファイルを ChromaDB に投入する。
 
+    投入順序（delete-then-add トランザクション）:
+        1. 同じ source_file メタを持つ既存チャンクを delete で全削除
+        2. 新しいチャンクを add で投入
+
+    これにより以下を防ぐ:
+        - 再処理時のチャンク数変動による孤児チャンク
+          （例: 前回 5 チャンク → 今回 3 チャンクの場合、upsert だと
+                chunk003/004 が古いまま残る）
+        - pipeline.py が Step 3 の途中で停止した場合の中途半端な投入残骸
+
+    中断時のトレードオフ:
+        delete 完了後 / add 完了前に死ぬと、ChromaDB から該当ノートが一時的に消える。
+        ただし「重複」より「欠落」の方が検索結果としてマシ（次回再投入で復元される）。
+
     Args:
         md_path: 投入する .md のパス。
         collection: ChromaDB コレクション。
@@ -163,8 +177,20 @@ def ingest_file(
             }
         )
 
-    # upsert: 同 ID が存在すれば置き換え、なければ追加
-    collection.upsert(
+    # --- Step 1: 同 source_file の既存チャンクを削除 ---
+    # 失敗（コレクションが空 / 該当なし）でも例外を投げない実装にする。
+    # where 条件で source_file が一致するエントリを全削除。
+    try:
+        collection.delete(where={"source_file": md_path.name})
+    except Exception as e:
+        # 削除失敗は警告のみ（既存が無い場合もここに入る可能性がある）
+        print(f"[warn] 既存チャンク削除でエラー（続行します）: {e}", file=sys.stderr)
+
+    # --- Step 2: 新規チャンクを追加 ---
+    # delete-then-add 戦略のため upsert ではなく add を使う。
+    # 同 ID が残っていた場合は add が例外を投げるが、Step 1 で削除済みのため
+    # 通常はぶつからない。
+    collection.add(
         ids=ids,
         documents=documents,
         embeddings=embeddings,

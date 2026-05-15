@@ -219,6 +219,46 @@ def release_lock(lock_file: Path, logger: logging.Logger) -> None:
         logger.warning(f"lock file の削除に失敗しました: {e}")
 
 
+def cleanup_tmp_files(
+    transcripts_dir: Path,
+    notes_dir: Path,
+    logger: logging.Logger,
+) -> int:
+    """起動時に中途半端な *.tmp ファイルを削除する。
+
+    transcribe.py / summarize.py はアトミック書き込み（*.tmp → os.replace で本名へ昇格）
+    を使うため、pipeline.py が Ctrl+C / taskkill で停止された場合、
+    昇格前の *.tmp ファイルが残骸として残る可能性がある。
+    起動時にこれらを削除しておかないと、ディスクの無駄遣いになるだけでなく、
+    次回再実行で同名 tmp の上書きが発生する点でも気持ち悪い。
+
+    Args:
+        transcripts_dir: 文字起こし出力ディレクトリ。
+        notes_dir: 要約ノート出力ディレクトリ。
+        logger: ロガー。
+
+    Returns:
+        削除した tmp ファイルの総数。
+    """
+    deleted = 0
+    for target_dir, pattern in [
+        (transcripts_dir, "*.tmp"),
+        (notes_dir, "*.tmp"),
+    ]:
+        if not target_dir.exists():
+            continue
+        for tmp_file in target_dir.glob(pattern):
+            try:
+                tmp_file.unlink()
+                deleted += 1
+                logger.info(f"中途半端な tmp ファイルを削除: {tmp_file.name}")
+            except OSError as e:
+                logger.warning(f"tmp ファイル削除失敗（処理は継続）: {tmp_file.name}: {e}")
+    if deleted > 0:
+        logger.info(f"起動時クリーンアップ: tmp ファイル {deleted} 件削除")
+    return deleted
+
+
 def write_state(
     state_file: Path,
     current: dict[str, Any] | None,
@@ -1224,6 +1264,15 @@ def main() -> int:
     if not acquire_lock(lock_file, logger):
         # 既に起動中 → exit code 1 で終了（service_manager 側でも検知可能）
         return 1
+
+    # --- 起動時クリーンアップ: 中途半端な *.tmp ファイルを削除 ---
+    # 設定で無効化できる（cleanup_tmp_on_startup: false）が、デフォルトは有効。
+    # transcribe.py / summarize.py はアトミック書き込みを使うため、
+    # 前回 pipeline.py が異常終了した場合の残骸を起動時にお掃除する。
+    if settings.get("pipeline", {}).get("cleanup_tmp_on_startup", True):
+        transcripts_dir = resolve_path(settings["paths"]["transcripts_dir"])
+        notes_dir = resolve_path(settings["paths"]["notes_dir"])
+        cleanup_tmp_files(transcripts_dir, notes_dir, logger)
 
     logger.info(f"音声フォルダ監視を開始: {input_dir}")
     logger.info(f"テキスト監視も開始: {text_input_dir}")

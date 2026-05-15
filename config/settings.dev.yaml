@@ -104,6 +104,11 @@ pipeline:
   # 多重起動防止用 lock file のパス（pipeline.py が起動時に作成し、終了時に削除する）
   # 別のパスにしたい場合は絶対パスか PROJECT_ROOT 相対パスを指定する
   lock_file: data/logs/pipeline.lock
+  # 起動時に data/transcripts/*.tmp と data/notes/*.tmp を削除するか
+  # transcribe.py / summarize.py はアトミック書き込み（*.tmp → os.replace）を使うため、
+  # pipeline.py が Ctrl+C / taskkill で停止すると中途半端な *.tmp が残る場合がある。
+  # 通常は true のままで OK（false にする理由が無ければ触らない）。
+  cleanup_tmp_on_startup: true
   # --- 失敗ファイル隔離設定 ---
   # この回数連続失敗したファイルを data/input/failed/ に隔離する
   # 隔離後は record_gui.py の「失敗一覧」ダイアログから再試行または削除できる

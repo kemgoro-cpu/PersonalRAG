@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -366,7 +367,20 @@ def main() -> int:
     markdown = render_markdown(parsed, raw_response, transcript_path, recording_meta=recording_meta)
 
     output_path = build_output_path(transcript_path, notes_dir)
-    output_path.write_text(markdown, encoding="utf-8")
+    # --- アトミック書き込み ---
+    # transcribe.py と同じ理由（pipeline.py 停止時に中途半端な .md を残さない）。
+    # *.tmp に書いてから os.replace で本ファイルに昇格させる。
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        tmp_path.write_text(markdown, encoding="utf-8")
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     print(f"[output] 保存しました: {output_path}")
     if parsed is None:
         print(
