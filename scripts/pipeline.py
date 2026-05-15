@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import threading
+
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -110,6 +112,45 @@ def write_state(
     except Exception as e:
         # ディスクフル・権限エラー等は warning だけ出して続行
         logger.warning(f"状態ファイルの書き込み失敗（処理は継続します）: {e}")
+
+
+def touch_state(state_file: Path, logger: logging.Logger) -> None:
+    """state.json の updated_at だけを現在時刻に更新する（heartbeat 用）。
+
+    既存の current / queue / recent フィールドはそのまま保持する。
+    ファイルが存在しない・壊れている場合は空の状態で新規作成する。
+    書き込みはアトミック（一時ファイル経由）で行い、write_state() との
+    同時実行が起きても JSON が壊れることはない（最後の書き込みが残る）。
+
+    Args:
+        state_file: 更新対象の状態ファイルパス。
+        logger: ロガー。
+    """
+    try:
+        now = _now_iso()
+        # 既存ファイルを読み込んで current/queue/recent を保持する
+        payload: dict = {"updated_at": now, "current": None, "queue": [], "recent": []}
+        if state_file.exists():
+            try:
+                existing = json.loads(state_file.read_text(encoding="utf-8"))
+                # updated_at 以外のフィールドを既存値で上書き（None/空のまま保持）
+                payload["current"] = existing.get("current", None)
+                payload["queue"] = existing.get("queue", [])
+                payload["recent"] = existing.get("recent", [])
+            except Exception:
+                # 読み込み失敗（壊れた JSON 等）は空の状態で上書きする
+                pass
+
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = state_file.with_suffix(".json.tmp")
+        tmp_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp_file, state_file)
+    except Exception as e:
+        # heartbeat の失敗は警告だけ出して続行（pipeline 本処理は止めない）
+        logger.warning(f"heartbeat の状態ファイル更新失敗（処理は継続します）: {e}")
 
 
 def wait_until_stable(path: Path, wait_seconds: int, logger: logging.Logger) -> bool:
@@ -853,12 +894,44 @@ def main() -> int:
     observer.schedule(text_handler, str(text_input_dir), recursive=False)
     observer.start()
 
+    # --- heartbeat: 10 秒おきに updated_at を更新し「停止中」誤判定を防ぐ ---
+    # heartbeat_interval_seconds は設定ファイルで変更可能（デフォルト 10 秒）。
+    # record_gui.py / service_manager.py の両方が「30 秒以内なら稼働中」と判定するため、
+    # 10 秒間隔なら最悪でも次の heartbeat まで 10 秒の猶予がある（閾値の 1/3）。
+    heartbeat_interval: int = int(
+        settings.get("pipeline", {}).get("heartbeat_interval_seconds", 10)
+    )
+    # daemon=True: main() が終了 or 例外で抜けたとき自動でスレッドも停止する
+    heartbeat_stop = threading.Event()
+
+    def _heartbeat_worker() -> None:
+        """heartbeat 専用 daemon thread の本体。
+        heartbeat_stop がセットされるまで heartbeat_interval 秒おきに touch_state を呼ぶ。
+        """
+        while not heartbeat_stop.wait(timeout=heartbeat_interval):
+            touch_state(state_file, logger)
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_worker,
+        daemon=True,
+        name="pipeline-heartbeat",
+    )
+    heartbeat_thread.start()
+    logger.info(
+        f"heartbeat スレッド起動 (間隔: {heartbeat_interval}s, state_file: {state_file})"
+    )
+
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("停止シグナルを受信、終了します...")
         observer.stop()
+    finally:
+        # KeyboardInterrupt / SystemExit どちらの場合も heartbeat を停止する
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=heartbeat_interval + 5)
+
     observer.join()
     return 0
 

@@ -107,6 +107,9 @@ pipeline:
   notify_on_success: true
   # パイプライン処理状態の出力先（record_gui.py がここを読んで状態を表示する）
   state_file: data/logs/pipeline_state.json
+  # heartbeat 間隔（秒）: この間隔で updated_at を更新し「停止中」誤判定を防ぐ
+  # record_gui.py / service_manager.py の稼働判定しきい値（30秒）の 1/3 以下を推奨
+  heartbeat_interval_seconds: 10
 
 # --- Step 5: Open WebUI Knowledge 自動同期設定 ---
 openwebui:

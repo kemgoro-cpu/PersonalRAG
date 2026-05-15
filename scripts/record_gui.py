@@ -175,6 +175,12 @@ class RecordingApp:
         self._start_all_btn: Any = None
         self._stop_all_btn: Any = None
 
+        # --- tooltip 管理（Bug 2 修正）---
+        # キー: id(widget)、値: tk.Toplevel
+        # クロージャではなくインスタンス変数で管理することで、
+        # 多重生成・残留リークを防ぐ（id(widget) は同一 widget に対して一意）
+        self._tooltip_windows: dict[int, tk.Toplevel] = {}
+
         # --- 画像（pystray 利用可能時のみ生成） ---
         self._gray_image: Any = self._make_icon_image("gray") if Image else None
         self._red_image: Any = self._make_icon_image("red") if Image else None
@@ -258,11 +264,13 @@ class RecordingApp:
         self.status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
         # 保存先パス（小さく表示）＋「📁 変更...」ボタン
+        # wraplength=480: ウィンドウ幅 520 から左右の余白を引いた値。
+        # 長いパス（NAS の UNC パスや日本語入りパス）が切れずに改行表示される。
         ttk.Label(frame, text="保存先:", foreground="#666").grid(row=4, column=0, sticky="w")
         self.path_var = tk.StringVar(value=str(self.recordings_dir))
-        ttk.Label(frame, textvariable=self.path_var, foreground="#666").grid(
-            row=4, column=1, sticky="w"
-        )
+        ttk.Label(
+            frame, textvariable=self.path_var, foreground="#666", wraplength=480
+        ).grid(row=4, column=1, sticky="w")
         # 「📁 変更...」ボタン: フォルダ選択ダイアログで録音保存先を変更する
         ttk.Button(
             frame,
@@ -967,28 +975,40 @@ class RecordingApp:
     # サービス管理タブの表示更新とボタン操作
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _create_tooltip(widget: Any, text: str) -> None:
-        """ウィジェットにマウスホバー tooltip を付与する。
+    def _create_tooltip(self, widget: Any, text: str) -> None:
+        """ウィジェットにマウスホバー tooltip を付与する（インスタンスメソッド版）。
 
         tkinter には標準 tooltip がないため、<Enter> / <Leave> イベントで
-        Toplevel ウィンドウを出し入れする簡易実装。
+        Toplevel ウィンドウを出し入れする実装。
+
+        クロージャではなく self._tooltip_windows（dict）で状態を管理することで、
+        「100ms ごとに unbind/rebind しても古い Toplevel が destroy されないままリーク
+        し続ける」問題を解消する。id(widget) をキーにするため、同じ widget に対する
+        tooltip は最大 1 つだけ存在が保証される。
 
         Args:
             widget: tooltip を付けたいウィジェット
             text:   tooltip に表示する文字列
         """
-        tooltip_win: list[tk.Toplevel | None] = [None]  # クロージャで状態共有
+        widget_id = id(widget)
 
         def _show(event: Any) -> None:
-            """マウスが widget に乗ったとき: tooltip を表示する。"""
-            if tooltip_win[0] is not None:
-                return  # 既に表示中なら何もしない
-            tip = tk.Toplevel(widget)
+            """マウスが widget に乗ったとき: 既存 Toplevel を destroy してから新規作成。"""
+            # 既存 Toplevel があれば先に破棄（多重生成防止）
+            existing = self._tooltip_windows.get(widget_id)
+            if existing is not None:
+                try:
+                    existing.destroy()
+                except Exception:
+                    pass
+            tip = tk.Toplevel(self.root)
             tip.wm_overrideredirect(True)   # タイトルバーを消す
-            tip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+            # widget の真下に表示（マウス座標ベースより安定する）
+            x = widget.winfo_rootx() + 20
+            y = widget.winfo_rooty() + widget.winfo_height() + 5
+            tip.wm_geometry(f"+{x}+{y}")
             tip.attributes("-topmost", True)
-            label = tk.Label(
+            tk.Label(
                 tip,
                 text=text,
                 justify="left",
@@ -998,26 +1018,27 @@ class RecordingApp:
                 font=("", 9),
                 padx=6,
                 pady=4,
-            )
-            label.pack()
-            tooltip_win[0] = tip
+            ).pack()
+            self._tooltip_windows[widget_id] = tip
 
         def _hide(event: Any) -> None:
-            """マウスが widget から離れたとき: tooltip を閉じる。"""
-            if tooltip_win[0] is not None:
-                tooltip_win[0].destroy()
-                tooltip_win[0] = None
+            """マウスが widget から離れたとき: Toplevel を破棄して dict から削除。"""
+            existing = self._tooltip_windows.pop(widget_id, None)
+            if existing is not None:
+                try:
+                    existing.destroy()
+                except Exception:
+                    pass
 
         widget.bind("<Enter>", _show)
         widget.bind("<Leave>", _hide)
 
-    @staticmethod
-    def _set_tooltip(widget: Any, text: str) -> None:
-        """tooltip を安全に付け替えるラッパー。
+    def _set_tooltip(self, widget: Any, text: str) -> None:
+        """tooltip を安全に付け替えるラッパー（インスタンスメソッド版）。
 
         毎回 <Enter> / <Leave> の binding を unbind してからセットし直すことで、
         状態遷移後に古い tooltip が残留する問題を防ぐ。
-        text が空文字の場合は binding を外すだけで tooltip を付けない。
+        text が空文字の場合は binding を外し、既存 Toplevel も destroy する。
 
         注意: <Enter> / <Leave> のみを操作し、クリック等の他の binding は維持する。
 
@@ -1028,9 +1049,17 @@ class RecordingApp:
         # 既存の Enter/Leave binding を解除（他の binding は維持）
         widget.unbind("<Enter>")
         widget.unbind("<Leave>")
+        # text が空文字のときは既存 Toplevel も確実に消す
+        widget_id = id(widget)
+        existing = self._tooltip_windows.pop(widget_id, None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except Exception:
+                pass
         # text が指定されている場合のみ新規 binding を付ける
         if text:
-            RecordingApp._create_tooltip(widget, text)
+            self._create_tooltip(widget, text)
 
     def _update_service_tab(self, cache: dict[str, ServiceInfo]) -> None:
         """サービス管理タブの各行ウィジェットをキャッシュの内容で更新する。
