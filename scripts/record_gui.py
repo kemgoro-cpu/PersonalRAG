@@ -349,11 +349,21 @@ class RecordingApp:
         # 件数は _tick() が 5 秒おきに更新する
         self._failed_files_btn = ttk.Button(
             frame,
-            text="失敗一覧 (0)",
+            text="隔離ファイル (0)",
             command=self._show_failed_files_dialog,
             width=14,
         )
         self._failed_files_btn.grid(row=11, column=1, sticky="w", pady=(6, 0))
+
+        # 凡例: 「最近の処理 ✗ N 件」と「隔離ファイル (N)」の区別をユーザーに案内する
+        # 1 回失敗しただけのファイルは retry_count.json に積まれて再試行され、
+        # 連続失敗が retry_max (デフォルト 3) に到達したら failed/ に隔離される
+        ttk.Label(
+            frame,
+            text="（連続失敗が 3 回に達したファイルが「隔離ファイル」として一覧表示されます）",
+            font=("", 8),
+            foreground="#666",
+        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -981,7 +991,11 @@ class RecordingApp:
             self._pipeline_recent_var.set("最近の処理: — （読み込み失敗）")
 
     def _update_pipeline_recent_count(self, recent: list) -> None:
-        """直近 24 時間の成功/失敗件数を集計して _pipeline_recent_var を更新する。
+        """直近 24 時間の成功/失敗件数 + 現在リトライ中の件数を集計して
+        _pipeline_recent_var を更新する。
+
+        recent[] は 24h 内の処理結果（個々の試行）、retry_count.json は
+        「現時点でリトライ中」のファイル数を表す。両者は別概念のためラベルに併記する。
 
         Args:
             recent: pipeline_state.json の "recent" リスト
@@ -1004,9 +1018,38 @@ class RecordingApp:
                         fail_count += 1
             except Exception:
                 pass  # パース失敗のエントリは無視
+
+        # retry_count.json からリトライ中の件数を取得（読み込み失敗時は 0）
+        retrying_count = self._count_retrying_files()
+
         self._pipeline_recent_var.set(
             f"最近の処理（直近 24h）: ✓ {success_count} 件 / ✗ {fail_count} 件"
+            f"  ／  リトライ中: {retrying_count} 件"
         )
+
+    def _count_retrying_files(self) -> int:
+        """retry_count.json を読み込んでリトライ中のファイル数を返す。
+
+        リトライ中 = 失敗したが連続失敗回数が retry_max に達していないファイル。
+        ファイル不在 / 壊れた JSON は 0 件として扱う。
+
+        Returns:
+            リトライ中ファイル数（0 以上）
+        """
+        try:
+            settings = load_settings()
+            rcf_rel = settings.get("pipeline", {}).get(
+                "retry_count_file", "data/logs/retry_count.json"
+            )
+            rcf = resolve_path(rcf_rel)
+            if not rcf.exists():
+                return 0
+            data = json.loads(rcf.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return len(data)
+            return 0
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # サービス管理タブの表示更新とボタン操作
@@ -1494,7 +1537,7 @@ class RecordingApp:
             count = 0
 
         self._failed_count = count
-        label = f"失敗一覧 ({count})"
+        label = f"隔離ファイル ({count})"
         if count == 0:
             # 件数 0: ボタンを無効化（押しても何もない状態なので混乱を防ぐ）
             self._failed_files_btn.config(text=label, state="disabled")
@@ -1657,7 +1700,7 @@ class RecordingApp:
                 logger.warning(f"failed_files.json の保存失敗: {exc}")
             # ボタンラベルを即時更新
             self._failed_count = len(new_history)
-            label = f"失敗一覧 ({self._failed_count})"
+            label = f"隔離ファイル ({self._failed_count})"
             if self._failed_files_btn is not None:
                 state = "normal" if self._failed_count > 0 else "disabled"
                 self._failed_files_btn.config(text=label, state=state)
