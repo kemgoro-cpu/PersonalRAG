@@ -42,6 +42,8 @@
 - pipeline 30 秒 OFF 誤判定 → heartbeat thread 追加
 - path traversal リスク（`failed_files.json`、`search_lib.py`）→ basename + `is_relative_to` 二重防御
 - 各種ラベル表示の混乱（「失敗一覧」→「隔離ファイル」）
+- `ingest_db.strip_frontmatter` の YAML リスト `keywords` 解釈バグを修正
+- GUI の「リトライ中」件数を、`retry_count.json` 全件ではなく実ファイルが投入フォルダに残るものだけ数えるよう修正
 
 ### Git 状態
 
@@ -54,9 +56,9 @@
 
 - **動作**: ローカル運用で録音 → pipeline → 要約 → ChromaDB 投入まで全て稼働確認済み
 - **設定**: `paths.recordings_dir: data/recordings` / `paths.input_dir: data/input`（**現状別フォルダ**、NAS パス未設定）
-- **未処理 WAV**: ユーザーが既存 WAV を `data/input/` に移動して順次処理中
-- **失敗ファイル**: 現状 `retry_count.json` に 5 件がリトライ中（`count: 1`）、隔離 0 件
-- **テスト**: pytest で 20 件 PASS（retry_tracker のみ）、py_compile + import チェックすべて通る
+- **未処理 WAV**: 現状 `data/input/` 直下に `rec_2026-05-15_140351.wav` と `.meta.json` が残存
+- **失敗ファイル**: `retry_count.json` には古い残骸を含む 11 件が残存。ただし実ファイルが投入フォルダに残るアクティブなリトライ対象は 1 件、隔離 0 件
+- **テスト**: pytest で 26 件 PASS（retry_tracker + ingest_db frontmatter）、py_compile チェック通過
 
 ---
 
@@ -71,7 +73,9 @@
 
 ### 優先度: 中（動作確認と微調整）
 
-- **リトライ中 5 件の WAV の挙動を観察**
+- **リトライ中 WAV の挙動を観察**
+  - 2026-05-15 の `transcribe.py` 失敗は多くが `returncode=3221226505`（`0xC0000409`）で同じ系統
+  - 現在 `data/input/` に残る実ファイルは `rec_2026-05-15_140351.wav` のみ
   - 何度処理しても同じエラーで失敗するなら 3 回到達で `failed/` に隔離される予定
   - 何が原因で失敗しているか `data/logs/pipeline.log` を見てトリアージ
 - **停止時クズ対策の動作確認**
@@ -79,8 +83,6 @@
 
 ### 優先度: 低（任意改善）
 
-- **既存バグ（spawn 済み）**: `ingest_db.strip_frontmatter` が YAML リスト形式の `keywords` を解釈できない件
-  - チップから 1 クリックで別 worktree に作業を回せる
 - **worktree のクリーンアップ**
   - `claude/gracious-banach-010b7d` / `claude/naughty-bardeen-8d9e65` は使い終わったので閉じてよい
 
@@ -107,6 +109,6 @@
 - **VRAM 競合の手動回避ルール**: README に「文字起こし中は Open WebUI 停止」と明記されているが、フェーズ C のサービス管理タブから自動的にロックする仕組みはなし。警告ラベルのみ
 - **`gemma4:e4b-it-q4_K_M` の動作確認**: 本番機（RTX Pro 2000 16GB）想定、開発機では未検証
 
-### 既知の既存バグ（spawn task 化済み、未着手）
+### 既知の既存バグ
 
-- `ingest_db.strip_frontmatter` の **YAML リスト keywords 解釈バグ**: `keywords: [- ECU, - 設計]` のような形式が空文字としてメタに入る。検索品質に影響する可能性あり
+- 現時点で handoff に残す既知バグはなし。`ingest_db.strip_frontmatter` の YAML リスト `keywords` 解釈バグは修正済み

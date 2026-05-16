@@ -30,6 +30,7 @@ from retry_tracker import (
     save_retry_state,
     increment_retry_count,
     clear_retry_count,
+    count_active_retries,
     append_failed_history,
     is_quarantined,
 )
@@ -178,6 +179,45 @@ class TestClearRetryCount:
         state = load_retry_state(tmp_retry_file)
         assert "file_a.wav" not in state
         assert "file_b.wav" in state
+
+
+# ============================================================
+# count_active_retries のテスト
+# ============================================================
+
+class TestCountActiveRetries:
+    """count_active_retries のテストグループ。"""
+
+    def test_counts_only_files_present_in_input_dirs(self, tmp_retry_file: Path, tmp_path: Path) -> None:
+        """retry_count.json に残骸があっても、実ファイルがあるものだけ数える。"""
+        input_dir = tmp_path / "input"
+        text_dir = tmp_path / "input_text"
+        input_dir.mkdir()
+        text_dir.mkdir()
+        (input_dir / "active.wav").write_text("audio", encoding="utf-8")
+        (text_dir / "meeting.docx").write_text("text", encoding="utf-8")
+
+        state = {
+            "active.wav": {"count": 1},
+            "meeting.docx": {"count": 1},
+            "already_processed.wav": {"count": 1},
+        }
+        save_retry_state(tmp_retry_file, state, test_logger)
+
+        assert count_active_retries(tmp_retry_file, [input_dir, text_dir]) == 2
+
+    def test_uses_basename_to_avoid_path_traversal(self, tmp_retry_file: Path, tmp_path: Path) -> None:
+        """retry_count.json のキーにパスが混じっても basename のみを見る。"""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "evil.wav").write_text("audio", encoding="utf-8")
+
+        state = {
+            "../outside/evil.wav": {"count": 1},
+        }
+        save_retry_state(tmp_retry_file, state, test_logger)
+
+        assert count_active_retries(tmp_retry_file, [input_dir]) == 1
 
 
 # ============================================================

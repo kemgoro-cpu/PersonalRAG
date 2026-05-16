@@ -18,6 +18,7 @@ Step 3: data/notes/*.md を読み込み、ChromaDB に埋め込みベクター�
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -25,8 +26,26 @@ from typing import Any
 
 import chromadb
 import ollama
+import yaml
 
 from config_loader import load_settings, resolve_path
+
+
+def _stringify_frontmatter_value(value: Any) -> str:
+    """ChromaDB metadata に入れられるようフロントマター値を文字列化する。
+
+    YAML の `keywords` は summarize.py がリスト形式で出力するため、
+    そのまま ChromaDB metadata に渡すのではなく検索しやすい文字列に正規化する。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(_stringify_frontmatter_value(item) for item in value if item is not None)
+    if isinstance(value, tuple):
+        return ", ".join(_stringify_frontmatter_value(item) for item in value if item is not None)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
 
 
 def strip_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -45,11 +64,18 @@ def strip_frontmatter(text: str) -> tuple[dict[str, str], str]:
         return {}, text
     meta_block = parts[1].strip()
     body = parts[2].lstrip("\n")
-    meta: dict[str, str] = {}
-    for line in meta_block.splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            meta[k.strip()] = v.strip()
+    try:
+        parsed = yaml.safe_load(meta_block) or {}
+    except yaml.YAMLError:
+        return {}, body
+    if not isinstance(parsed, dict):
+        return {}, body
+
+    meta: dict[str, str] = {
+        str(key).strip(): _stringify_frontmatter_value(value).strip()
+        for key, value in parsed.items()
+        if str(key).strip()
+    }
     return meta, body
 
 

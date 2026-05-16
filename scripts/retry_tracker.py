@@ -198,6 +198,38 @@ def clear_retry_count(
         logger.info(f"リトライカウントをクリア（処理成功）: {file_name}")
 
 
+def count_active_retries(
+    retry_count_file: Path,
+    input_dirs: list[Path],
+) -> int:
+    """実際に入力フォルダへ残っているリトライ対象ファイル数を返す。
+
+    retry_count.json には、過去の異常終了や手動移動で古いエントリが残ることがある。
+    GUI の「リトライ中」表示では、いま pipeline.py が再処理できる実ファイルだけを
+    数えることで、ユーザーに古い残骸をリトライ中として見せない。
+
+    Args:
+        retry_count_file: retry_count.json のパス。
+        input_dirs:       音声・テキスト投入先ディレクトリのリスト。
+
+    Returns:
+        実ファイルが入力フォルダ直下に存在する retry_count エントリ数。
+    """
+    state = load_retry_state(retry_count_file)
+    if not state:
+        return 0
+
+    count = 0
+    for file_name in state:
+        # JSON 側が手編集されてもディレクトリ外を見に行かないよう basename に限定する
+        safe_name = Path(file_name).name
+        if not safe_name:
+            continue
+        if any((input_dir / safe_name).is_file() for input_dir in input_dirs):
+            count += 1
+    return count
+
+
 def append_failed_history(
     failed_files_log: Path,
     entry: dict,

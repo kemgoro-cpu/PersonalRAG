@@ -1042,12 +1042,12 @@ class RecordingApp:
                 "retry_count_file", "data/logs/retry_count.json"
             )
             rcf = resolve_path(rcf_rel)
-            if not rcf.exists():
-                return 0
-            data = json.loads(rcf.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return len(data)
-            return 0
+            input_dirs = [
+                resolve_path(settings["paths"]["input_dir"]),
+                resolve_path(settings["paths"]["input_text_dir"]),
+            ]
+            from retry_tracker import count_active_retries
+            return count_active_retries(rcf, input_dirs)
         except Exception:
             return 0
 
