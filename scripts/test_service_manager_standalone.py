@@ -9,7 +9,7 @@ ServiceManager の単体テスト（Ollama / Open WebUI を起動していない
 - Open WebUI が起動していない環境で check_open_webui() が STOPPED を返すことを確認
 - pipeline_state.json が存在しない場合に check_pipeline() が STOPPED を返すことを確認
 - pipeline_state.json の updated_at が 60 秒以上前の場合に STOPPED を返すことを確認
-- pipeline_state.json の updated_at が 5 秒前の場合に RUNNING を返すことを確認
+- pipeline_state.json の updated_at が 5 秒前かつ lock PID 生存中の場合に RUNNING を返すことを確認
 """
 
 from __future__ import annotations
@@ -28,12 +28,18 @@ sys.path.insert(0, str(scripts_dir))
 from service_manager import ServiceManager, ServiceStatus
 
 
-def make_manager(state_file: Path | None = None) -> ServiceManager:
+def make_manager(
+    state_file: Path | None = None,
+    lock_file: Path | None = None,
+) -> ServiceManager:
     """テスト用の ServiceManager を作成するヘルパー。"""
     project_root = Path(__file__).resolve().parent.parent
+    if lock_file is None and state_file is not None:
+        lock_file = state_file.with_suffix(".lock")
     settings: dict = {
         "pipeline": {
             "state_file": str(state_file) if state_file else "data/logs/pipeline_state.json",
+            "lock_file": str(lock_file) if lock_file else "data/logs/pipeline.lock",
         },
         "llm": {"host": "http://localhost:11434"},
         "openwebui": {"base_url": "http://localhost:3000"},
@@ -42,6 +48,8 @@ def make_manager(state_file: Path | None = None) -> ServiceManager:
     # 状態ファイルのパスを直接上書き（設定ファイルを経由せずにテスト）
     if state_file is not None:
         mgr._pipeline_state_file = state_file
+    if lock_file is not None:
+        mgr._pipeline_lock_file = lock_file
     return mgr
 
 
@@ -100,8 +108,8 @@ def test_pipeline_stale_state_file() -> None:
         tmp_path.unlink(missing_ok=True)
 
 
-def test_pipeline_fresh_state_file() -> None:
-    """updated_at が 5 秒前の場合 RUNNING が返ることを確認する。"""
+def test_pipeline_fresh_state_file_without_lock() -> None:
+    """updated_at が 5 秒前でも lock がなければ STOPPED が返ることを確認する。"""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, encoding="utf-8"
     ) as f:
@@ -112,10 +120,32 @@ def test_pipeline_fresh_state_file() -> None:
     try:
         mgr = make_manager(state_file=tmp_path)
         info = mgr.check_pipeline()
-        assert info.status == ServiceStatus.RUNNING, f"Expected RUNNING, got {info.status}"
-        print("  PASS: Pipeline RUNNING (fresh state file)")
+        assert info.status == ServiceStatus.STOPPED, f"Expected STOPPED, got {info.status}"
+        print("  PASS: Pipeline STOPPED (fresh state file without lock)")
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def test_pipeline_fresh_state_file_with_lock() -> None:
+    """updated_at が 5 秒前かつ lock PID が生存中なら RUNNING が返ることを確認する。"""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    ) as f:
+        fresh_time = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        json.dump({"updated_at": fresh_time, "current": None, "queue": [], "recent": []}, f)
+        tmp_path = Path(f.name)
+
+    lock_path = Path(tempfile.gettempdir()) / "pipeline_lock_live_pid_test.lock"
+    lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    try:
+        mgr = make_manager(state_file=tmp_path, lock_file=lock_path)
+        info = mgr.check_pipeline()
+        assert info.status == ServiceStatus.RUNNING, f"Expected RUNNING, got {info.status}"
+        print("  PASS: Pipeline RUNNING (fresh state file with live lock)")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        lock_path.unlink(missing_ok=True)
 
 
 def test_check_all_returns_three_items() -> None:
@@ -149,9 +179,10 @@ def test_stop_service_when_not_started() -> None:
     _processes にエントリがない場合、taskkill は呼ばれず False が返る。
     """
     mgr = make_manager()
+    mgr._detect_external_pids = lambda _name: []  # 実環境の外部サービスを止めない
     ok, msg = mgr.stop_service("Ollama")
     assert ok is False, f"起動していないのに ok=True が返った: {msg}"
-    assert "外部起動" in msg or "起動していません" in msg, f"メッセージが想定外: {msg}"
+    assert "停止対象 PID" in msg or "起動していません" in msg, f"メッセージが想定外: {msg}"
     print("  PASS: stop_service() on unstarted service returns False safely")
 
 
@@ -166,6 +197,7 @@ def test_stop_service_already_exited_popen() -> None:
     import threading as _threading
 
     mgr = make_manager()
+    mgr._detect_external_pids = lambda _name: []  # 実環境の外部サービスを止めない
 
     # 即座に終了するプロセスを起動して Popen を取得する
     proc = subprocess.Popen(
@@ -200,7 +232,8 @@ def main() -> None:
         test_webui_stopped,
         test_pipeline_no_state_file,
         test_pipeline_stale_state_file,
-        test_pipeline_fresh_state_file,
+        test_pipeline_fresh_state_file_without_lock,
+        test_pipeline_fresh_state_file_with_lock,
         test_check_all_returns_three_items,
         test_processes_dict_replaces_pids,
         test_stop_service_when_not_started,

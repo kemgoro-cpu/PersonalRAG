@@ -30,6 +30,7 @@
   - GUI に「隔離ファイル (N)」ボタン + 再試行/削除/エクスプローラで開く操作
   - リトライ中件数も状態ラベルに表示
 - **pipeline.py 単一インスタンス保証**: lock file (`data/logs/pipeline.lock`) + PID 生存チェック
+- **外部起動サービス停止**: サービス管理タブから外部起動の Ollama / Pipeline / Open WebUI も PID 検出できる場合は停止可能
 - **state.json ロック衝突リトライ**: WinError 32 を 5 回まで自動リトライ
 - **pipeline 停止時のクズファイル対策**: transcribe.py / summarize.py のアトミック書き込み、ingest_db.py の「同 source 削除 → 再投入」で重複防止
 
@@ -55,10 +56,10 @@
 ## 現在の状態
 
 - **動作**: ローカル運用で録音 → pipeline → 要約 → ChromaDB 投入まで全て稼働確認済み
-- **設定**: `paths.recordings_dir: data/recordings` / `paths.input_dir: data/input`（**現状別フォルダ**、NAS パス未設定）
+- **設定**: `paths.recordings_dir: data/input` / `paths.input_dir: data/input`（ローカル録音は pipeline 監視先へ直接保存）
 - **未処理 WAV**: 現状 `data/input/` 直下に `rec_2026-05-15_140351.wav` と `.meta.json` が残存
 - **失敗ファイル**: `retry_count.json` には古い残骸を含む 11 件が残存。ただし実ファイルが投入フォルダに残るアクティブなリトライ対象は 1 件、隔離 0 件
-- **テスト**: pytest で 26 件 PASS（retry_tracker + ingest_db frontmatter）、py_compile チェック通過
+- **テスト**: pytest で 45 件 PASS（retry_tracker + ingest_db frontmatter + pipeline lock + service_manager pipeline 判定 + 外部起動停止 + Open WebUI 起動中判定 + notes 自動同期監視）、py_compile チェック通過
 
 ---
 
@@ -92,7 +93,7 @@
 
 ### 仕様レベル
 
-- **`recordings_dir` と `input_dir` の関係**: NAS 構成への移行を前提とした「分離設計」のままで、ローカル運用を主とするユーザーには紛らわしい余地が残る
+- **`recordings_dir` と `input_dir` の関係**: ローカル単体運用のデフォルトは同一パスへ修正済み。NAS 構成では手元 PC の `recordings_dir` とリモート PC の `input_dir` を同じ UNC パスにする必要がある
 - **失敗ファイルの命名衝突**: 隔離時の `_001`/`_002` 連番は採用済みだが、同名ファイルが連続失敗で 999 を超えた場合の挙動は未定義（実用上はほぼ起きないが）
 - **メタ JSON の引き継ぎが transcript 経由**: `pipeline.py` が WAV 隣の `.meta.json` を transcript 隣にコピーする実装。録音 → 文字起こしの中で 1 ファイルだけ介在するので壊れにくいが、複数の文字起こし結果が同 audio に対して並存する場合の扱いは要検討
 
@@ -106,7 +107,7 @@
 ### 運用上の判断保留
 
 - **失敗ファイルの自動再試行ロジックの妥当性**: 現状は pipeline.py 起動時の `process_existing_files` で `data/input/` に残っているファイルを毎回拾い直すため、停止/起動を繰り返すとカウントが進む。**ユーザーが意図的に停止しただけのケースでも失敗扱いになる**ため、`stable_wait` 失敗等の一過性エラーと永続エラーの区別が現状はカウント上で同じ重みになっている
-- **VRAM 競合の手動回避ルール**: README に「文字起こし中は Open WebUI 停止」と明記されているが、フェーズ C のサービス管理タブから自動的にロックする仕組みはなし。警告ラベルのみ
+- **VRAM 競合の手動回避ルール**: README と GUI は「Open WebUI の画面表示」ではなく「Open WebUI 経由のチャットで Ollama/Gemma が動くこと」が競合要因と明記。フェーズ C のサービス管理タブから自動的にロックする仕組みはなし。警告ラベルのみ
 - **`gemma4:e4b-it-q4_K_M` の動作確認**: 本番機（RTX Pro 2000 16GB）想定、開発機では未検証
 
 ### 既知の既存バグ

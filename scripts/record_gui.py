@@ -114,6 +114,7 @@ class RecordingApp:
         settings = load_settings()
         rec_cfg = settings["recording"]
         self.recordings_dir: Path = resolve_path(settings["paths"]["recordings_dir"])
+        self._pipeline_input_dir: Path = resolve_path(settings["paths"]["input_dir"])
         self.hotkey: str = rec_cfg.get("hotkey", "ctrl+alt+r")
 
         # --- パイプライン状態ファイルのパス（pipeline.py が書き出すファイルを読む） ---
@@ -183,6 +184,7 @@ class RecordingApp:
             target=self._poll_services, daemon=True, name="service-poll"
         )
         self._service_poll_thread.start()
+        self.service_manager.start_notes_auto_sync()
 
         # サービスタブのウィジェット参照（_build_window で設定する）
         # 各行: {"status_label": Label, "detail_label": Label, "button": Button}
@@ -439,8 +441,8 @@ class RecordingApp:
         ttk.Label(
             frame,
             text=(
-                "注意: 文字起こし中の Open WebUI 起動は VRAM 競合の恐れあり。\n"
-                "Pipeline 停止後に Open WebUI を起動してください。"
+                "注意: 文字起こし中に Open WebUI でチャットすると、Ollama/Gemma と\n"
+                "Whisper が VRAM を奪い合う恐れがあります。チャット前に Pipeline を停止してください。"
             ),
             foreground="red",
             font=("", 9),
@@ -874,7 +876,17 @@ class RecordingApp:
                 participants=self._current_meta_participants,
                 topic=self._current_meta_topic,
             )
-            self.status_var.set(f"保存しました: {saved.name}")
+            try:
+                saved_is_watched = saved.parent.resolve() == self._pipeline_input_dir.resolve()
+            except OSError:
+                saved_is_watched = False
+
+            if saved_is_watched:
+                self.status_var.set(f"保存しました: {saved.name}")
+            else:
+                self.status_var.set(
+                    f"保存しました: {saved.name}（Pipeline 監視対象外）"
+                )
             self.path_var.set(str(saved))
 
         # メタ情報をリセット（次の録音セッションに引き継がない）
@@ -906,18 +918,12 @@ class RecordingApp:
     # ------------------------------------------------------------------
 
     def _update_pipeline_status(self) -> None:
-        """pipeline_state.json を読んでパイプライン状態 UI を更新する。
+        """pipeline_state.json と lock PID を読んでパイプライン状態 UI を更新する。
 
-        updated_at が現在時刻から 30 秒以内 → Pipeline 稼働中と判定する。
-        30 秒超 / ファイル不在 / パース失敗 → 「Pipeline 停止中」を赤字で表示する。
-
-        service_manager.check_pipeline() と同じ 30 秒しきい値を採用。
-        将来的に PIPELINE_FRESH_THRESHOLD_SECONDS として共通定数化できるが、
-        最小実装として record_gui.py 内で固定値 30 を使う。
+        状態ファイルの updated_at だけでは、古い heartbeat や壊れた lock と
+        組み合わさったときに「稼働中」と誤表示する可能性がある。
+        そのため、稼働判定は ServiceManager.check_pipeline() に集約する。
         """
-        # Pipeline 稼働判定のしきい値（秒）: service_manager.check_pipeline() と同値
-        PIPELINE_FRESH_THRESHOLD_SECONDS = 30
-
         try:
             if not self._pipeline_state_file.exists():
                 # ファイルがない → Pipeline 未起動
@@ -929,31 +935,10 @@ class RecordingApp:
             text = self._pipeline_state_file.read_text(encoding="utf-8")
             data = json.loads(text)
 
-            # --- updated_at で Pipeline の死活を判定 ---
-            updated_at_str: str = data.get("updated_at", "")
-            pipeline_alive = False
-            diff_seconds = None
-
-            if updated_at_str:
-                try:
-                    updated_at = datetime.fromisoformat(updated_at_str)
-                    if updated_at.tzinfo is None:
-                        updated_at = updated_at.replace(tzinfo=timezone.utc)
-                    now_utc = datetime.now(timezone.utc)
-                    diff_seconds = (now_utc - updated_at).total_seconds()
-                    pipeline_alive = diff_seconds <= PIPELINE_FRESH_THRESHOLD_SECONDS
-                except Exception:
-                    # updated_at のパース失敗 → 停止とみなす
-                    pipeline_alive = False
-
-            if not pipeline_alive:
+            pipeline_info = self.service_manager.check_pipeline()
+            if pipeline_info.status != ServiceStatus.RUNNING:
                 # 停止中の表示（赤系で目立たせる）
-                if diff_seconds is not None:
-                    self._pipeline_current_var.set(
-                        f"Pipeline 停止中（最終更新 {int(diff_seconds)}s 前）"
-                    )
-                else:
-                    self._pipeline_current_var.set("Pipeline 停止中（更新時刻不明）")
+                self._pipeline_current_var.set(f"Pipeline {pipeline_info.detail}")
                 self._pipeline_current_label.config(foreground="#cc0000")
                 # 停止中でも recent は読めるなら表示する
                 recent = data.get("recent", [])
@@ -1163,24 +1148,24 @@ class RecordingApp:
                 # 稼働中: 緑のインジケータ
                 status_label.config(text="● 稼働中", foreground="green")
                 detail_label.config(text=info.detail, foreground="#333")
-                # ボタンを「停止」に切替（ただしこのGUIが起動していない場合はグレーアウト）
-                # _processes は ServiceManager 側で内部ロック保護されているため
-                # こちら側の _service_status_lock とは独立。読み取りのみなので 'in' は安全
-                managed = name in self.service_manager._processes
-                if managed:
-                    btn.config(text="停止", state="normal")
-                    # 「停止」状態では tooltip 不要 → 既存 binding を外す
+                # 外部起動でも PID を検出できるものは停止可能にする。
+                btn.config(text="停止", state="normal")
+                if name in self.service_manager._processes:
                     self._set_tooltip(btn, "")
                 else:
-                    # 外部で起動されたサービスは停止ボタンをグレーアウト＆tooltip で説明
-                    # 「停止不可」→「外部起動」に変更してわかりやすくする
-                    btn.config(text="外部起動", state="disabled")
-                    # _set_tooltip を使うことで状態遷移時に古い binding を確実に外す
                     self._set_tooltip(
                         btn,
-                        "この GUI から起動したプロセスではないため停止できません。\n"
-                        "タスクマネージャから手動で停止してください。",
+                        "外部起動のプロセスです。検出した PID を taskkill で停止します。",
                     )
+            elif info.status == ServiceStatus.UNKNOWN:
+                # 起動中または HTTP 応答待ち: プロセスはあるので停止操作は許可する。
+                status_label.config(text="◐ 起動中", foreground="#b36b00")
+                detail_label.config(text=info.detail, foreground="#7a4a00")
+                btn.config(text="停止", state="normal")
+                self._set_tooltip(
+                    btn,
+                    "起動中のプロセスです。必要なら検出した PID を taskkill で停止します。",
+                )
             else:
                 # 停止中: グレーのインジケータ
                 status_label.config(text="○ 停止中", foreground="#888")
@@ -1344,8 +1329,7 @@ class RecordingApp:
                     0,
                     lambda: messagebox.showinfo(
                         "停止",
-                        "このGUIから起動したサービスはありません。\n"
-                        "外部で起動されたサービスは停止できません。"
+                        "稼働中として検出できるサービスはありません。"
                     ),
                 )
                 return
@@ -2113,6 +2097,7 @@ class RecordingApp:
         # サービスポーリングスレッドを停止する
         # （daemon=True なので強制終了でも問題ないが、正常に停止する）
         self._service_poll_stop.set()
+        self.service_manager.stop_notes_auto_sync()
 
         # 終了順序: hotkey スレッド → トレイスレッド → tkinter
         # 順序を間違えると pystray / hotkey スレッドが残ってプロセスが死なないことがある

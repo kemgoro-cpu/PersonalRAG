@@ -10,7 +10,7 @@ paths:
   transcripts_dir: data/transcripts  # 文字起こし結果（.txt）
   notes_dir: data/notes              # 要約・ToDo（.md）
   chromadb_dir: data/chromadb        # ベクターDB 永続化先
-  recordings_dir: data/recordings    # マイク録音の保存先
+  recordings_dir: data/input         # マイク録音の保存先（pipeline 監視先と同じ）
   logs_dir: data/logs                # ログ出力先
   # テキスト取り込み用: Teams/iPhone/Zoom 等の既成文字起こしを投入する
   input_text_dir: data/input_text               # テキストファイル投入先

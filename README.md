@@ -48,6 +48,7 @@ PersonalRAG/
 │       └── summarize.txt   # 要約プロンプト
 ├── .env.example            # 環境変数テンプレート
 ├── .gitignore
+├── PersonalRAG.cmd         # インストール不要のダブルクリック起動
 ├── requirements.txt
 └── README.md
 ```
@@ -324,7 +325,7 @@ python scripts/record_mic.py --transcribe
 毎回 PowerShell で CLI を叩くのが面倒な場合は、GUI ランチャを使うと便利です。
 ウィンドウのボタン、グローバルホットキー、タスクトレイのいずれからでも
 録音をトグルできます。停止すると WAV が `recordings_dir` に保存されます
-（リモート PC 構成では NAS パスに保存→自動処理される動線）。
+（ローカル単体運用のデフォルトでは `input_dir` と同じ場所なので自動処理されます）。
 
 ```powershell
 # 初回のみ依存ライブラリを追加インストール
@@ -334,12 +335,16 @@ pip install -r requirements.txt
 
 ##### 起動
 
-`scripts\record_gui.cmd` をダブルクリック。コンソール窓は表示されません（`pythonw.exe` 経由のため）。
+普段はリポジトリ直下の `PersonalRAG.cmd` をダブルクリックします。録音 GUI が開き、録音・ホットキー・トレイ常駐・サービス管理タブをそのまま使えます。
+
+インストーラや exe 化は不要です。会社 PC ではこのフォルダを置いたまま、`PersonalRAG.cmd` のショートカットだけをデスクトップに作る運用がおすすめです。
+
+従来どおり `scripts\record_gui.cmd` を直接ダブルクリックしても起動できます。
 
 ##### デスクトップショートカット作成
 
-1. エクスプローラで `scripts\record_gui.cmd` を右クリック → 「ショートカットの作成」
-2. 生成された `record_gui.cmd - ショートカット` をデスクトップへ移動
+1. エクスプローラで `PersonalRAG.cmd` を右クリック → 「ショートカットの作成」
+2. 生成された `PersonalRAG.cmd - ショートカット` をデスクトップへ移動
 3. （任意）右クリック → プロパティ → アイコン変更
 
 ##### 操作
@@ -465,7 +470,7 @@ recording:
 
 ```yaml
 paths:
-  recordings_dir: data/recordings    # ← ここを変更する
+  recordings_dir: data/input         # ← pipeline に拾わせるなら input_dir と同じにする
 ```
 
 **NAS / SMB パスを設定する場合の注意**:
@@ -535,14 +540,14 @@ Open WebUI を起動せずに `data/notes/*.md` を一覧・プレビュー・�
 
 ```
 ┌─ サービス管理 ────────────────────────────────────────┐
-│ Ollama:       ● 稼働中    稼働中        [ 外部起動 ]  │  ← 外部起動は停止不可
+│ Ollama:       ● 稼働中    稼働中(PID=...) [ 停止 ]   │  ← 外部起動も停止可
 │ Pipeline:     ● 稼働中    稼働中        [ 停止    ]   │
 │ Open WebUI:   ○ 停止中    停止中        [ 起動    ]   │
 │                                                       │
 │   [ すべて起動 ]  [ すべて停止 ]                      │
 │                                                       │
-│ 注意: 文字起こし中の Open WebUI 起動は VRAM 競合の   │
-│       恐れあり。Pipeline 停止後に起動してください。   │
+│ 注意: 文字起こし中に Open WebUI でチャットすると      │
+│       Ollama/Gemma と VRAM 競合の恐れあり。           │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -564,11 +569,20 @@ Open WebUI を起動せずに `data/notes/*.md` を一覧・プレビュー・�
 | Pipeline | `.venv\Scripts\pythonw.exe scripts\pipeline.py`（コンソール非表示） |
 | Open WebUI | `.venv-webui\Scripts\open-webui.exe serve --port 3000` |
 
+Open WebUI をこのタブから起動すると、HTTP 応答が確認できたあとに
+`scripts\sync_webui.py` をバックグラウンドで 1 回実行し、`data/notes/` の
+未同期 `.md` を Knowledge に回収します。結果は
+`data/logs/sync_webui_stdout.log` / `data/logs/sync_webui_stderr.log` に出力されます。
+GUI 起動中は `data/notes/` も軽く監視しており、新規・更新 `.md` が 5 秒ほど
+安定したあと、Open WebUI が稼働していれば同じ同期処理に回します。Open WebUI
+停止中の変更は保留され、次に Open WebUI が起動したタイミングで回収されます。
+
 ##### VRAM 競合の警告について
 
-文字起こし（Whisper）は VRAM を大量に使います。Pipeline が文字起こし中に Open WebUI を
-起動すると、Gemma（LLM）と VRAM を奪い合って Out of Memory エラーが発生します。
-**Open WebUI を使いたい場合は、先に Pipeline を停止してください。**
+文字起こし（Whisper）は VRAM を大量に使います。Open WebUI の画面表示自体は
+大きな GPU 負荷ではありませんが、チャットで回答を生成すると背後の Ollama/Gemma
+が動き、Whisper と VRAM を奪い合って Out of Memory エラーが発生する場合があります。
+**Open WebUI でチャットしたい場合は、先に Pipeline を停止してください。**
 
 詳しくは「運用ルール（VRAM 競合回避のため必読）」の表を参照してください。
 
@@ -583,12 +597,12 @@ GUI を閉じても、このタブから起動した Pipeline と Open WebUI は
 ##### 既知の制約
 
 - **Ollama** は通常システムサービスとして常駐しているため、GUI からの起動に失敗しても
-  「稼働中」と表示されます（既存プロセスを検知するため）。GUI からは停止できません
-- **外部で起動されたサービス**（このGUI以外から起動した Pipeline など）は「外部起動」
-  ボタンがグレーアウトされて停止できません。ボタンにカーソルを乗せると理由が表示されます。
-  停止はタスクマネージャから手動で行ってください
+  「稼働中」と表示されます（既存プロセスを検知するため）
+- **外部で起動されたサービス** も、GUI が PID を検出できる場合は「停止」できます。
+  Pipeline は `pipeline.lock` とこのプロジェクトの `pipeline.py`、Ollama / Open WebUI は
+  待受ポートから PID を検出し、その PID だけを `taskkill /T /F` で停止します
 - **Open WebUI の初回起動**はモデル一覧取得などで 30〜60 秒かかります。起動後しばらくは
-  「停止中」のままになることがあります（5 秒おきのポーリングで更新されます）
+  「起動中」と表示され、5 秒おきのポーリングで更新されます
 - GUI を強制終了（タスクマネージャ等）すると孫プロセスが残る場合があります。
   残った場合はタスクマネージャから手動で終了してください
 
@@ -737,6 +751,10 @@ python scripts/search.py "先週の会議で決まった納期は？"
 ### E. Open WebUI 自動同期（手動アップロード不要にする）
 
 pipeline.py が音声・テキストを処理すると、完了後に自動で WebUI Knowledge にアップロードします。
+Open WebUI が停止していて同期に失敗した分は、次にサービス管理タブから Open WebUI を
+起動したときにも自動回収されます。
+GUI 起動中に `data/notes/` へ手動で追加・更新した `.md` も、書き込みが安定したあと
+Open WebUI 稼働中なら自動同期されます。
 初回だけ以下のセットアップが必要です。
 
 #### 初回セットアップ手順
@@ -848,7 +866,7 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
      transcripts_dir: data/transcripts
      notes_dir: data/notes
      chromadb_dir: data/chromadb        # ← 絶対 NAS に置かない（SQLite ロック対策）
-     recordings_dir: data/recordings    # ← リモートでは未使用
+     recordings_dir: data/input         # ← リモートでは未使用
      logs_dir: data/logs
    ```
 3. Open WebUI を **LAN 公開**で起動:

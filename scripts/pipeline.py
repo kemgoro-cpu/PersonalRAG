@@ -151,7 +151,7 @@ def _is_pid_running(pid: int) -> bool:
 
 
 def acquire_lock(lock_file: Path, logger: logging.Logger) -> bool:
-    """lock file を取得する。既に起動中なら False を返して終了を促す。
+    """lock file を原子的に取得する。既に起動中なら False を返す。
 
     ロックファイルの設計:
         - 内容: 自プロセスの PID（整数）のみ
@@ -159,6 +159,7 @@ def acquire_lock(lock_file: Path, logger: logging.Logger) -> bool:
             - 生存中 → 「既に起動しています」とエラー出力して False を返す
             - 死亡（前回異常終了の残骸）→ lock file を上書きして起動継続
             - 読み取り失敗 → 安全側として上書きして継続
+        - 作成時: os.O_EXCL で排他作成し、同時起動の競合を防ぐ
 
     Args:
         lock_file: ロックファイルのパス。
@@ -169,52 +170,79 @@ def acquire_lock(lock_file: Path, logger: logging.Logger) -> bool:
     """
     lock_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if lock_file.exists():
-        try:
-            existing_pid = int(lock_file.read_text(encoding="utf-8").strip())
-            if _is_pid_running(existing_pid):
-                # 別の pipeline.py が生存中 → 多重起動を拒否
-                print(
-                    f"pipeline.py は既に起動しています (PID: {existing_pid})。"
-                    f"多重起動を防ぐため終了します。",
-                    file=sys.stderr,
-                )
-                logger.error(
-                    f"多重起動を検知: pipeline.py PID={existing_pid} が既に実行中"
-                )
-                return False
-            else:
-                # 前回異常終了の残骸 → 上書きして起動継続
+    for _attempt in range(3):
+        if lock_file.exists():
+            try:
+                existing_pid = int(lock_file.read_text(encoding="utf-8").strip())
+                if _is_pid_running(existing_pid):
+                    # 別の pipeline.py が生存中 → 多重起動を拒否
+                    print(
+                        f"pipeline.py は既に起動しています (PID: {existing_pid})。"
+                        f"多重起動を防ぐため終了します。",
+                        file=sys.stderr,
+                    )
+                    logger.error(
+                        f"多重起動を検知: pipeline.py PID={existing_pid} が既に実行中"
+                    )
+                    return False
+
+                # 前回異常終了の残骸 → 削除してから排他作成を試す
                 logger.warning(
                     f"古い lock file を検知 (PID={existing_pid} は既に終了済み)。"
-                    f"lock file を上書きして起動します。"
+                    f"lock file を作り直します。"
                 )
-        except (ValueError, OSError) as e:
-            # lock file が壊れている・読めない → 安全側として上書き継続
-            logger.warning(f"lock file の読み込み失敗（上書きして起動します）: {e}")
+                lock_file.unlink()
+            except (ValueError, OSError) as e:
+                # lock file が壊れている・読めない → 作り直す
+                logger.warning(f"lock file の読み込み失敗（作り直します）: {e}")
+                try:
+                    lock_file.unlink(missing_ok=True)
+                except OSError as unlink_error:
+                    logger.error(f"壊れた lock file の削除に失敗: {unlink_error}")
+                    return False
 
-    # lock file に自プロセスの PID を書き込む
-    try:
-        lock_file.write_text(str(os.getpid()), encoding="utf-8")
-        logger.info(f"lock file 作成: {lock_file} (PID={os.getpid()})")
-        return True
-    except OSError as e:
-        # lock file が書けない（ディスクフル等）でも起動は継続する（警告のみ）
-        logger.warning(f"lock file の作成に失敗しました（起動は継続）: {e}")
-        return True
+        try:
+            # O_EXCL により「存在確認 → 書き込み」の間に別プロセスが割り込む
+            # race condition を防ぐ。Windows でも Python の os.open で利用可能。
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(lock_file, flags)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            logger.info(f"lock file 作成: {lock_file} (PID={os.getpid()})")
+            return True
+        except FileExistsError:
+            # 直前に別プロセスが lock を作った。次ループで PID 生存確認を行う。
+            continue
+        except OSError as e:
+            logger.error(f"lock file の作成に失敗しました: {e}")
+            return False
+
+    logger.error("lock file の取得に失敗しました（同時起動競合が継続）")
+    return False
 
 
 def release_lock(lock_file: Path, logger: logging.Logger) -> None:
-    """lock file を削除する。終了時（finally 節）に呼ぶ。
+    """自プロセスが所有する lock file だけを削除する。
 
     Args:
         lock_file: 削除するロックファイルのパス。
         logger:    ロガー。
     """
     try:
-        if lock_file.exists():
-            lock_file.unlink()
-            logger.info(f"lock file を削除しました: {lock_file}")
+        if not lock_file.exists():
+            return
+
+        owner_pid = lock_file.read_text(encoding="utf-8").strip()
+        current_pid = str(os.getpid())
+        if owner_pid != current_pid:
+            logger.warning(
+                f"lock file の所有者が別 PID のため削除しません: "
+                f"owner={owner_pid}, current={current_pid}"
+            )
+            return
+
+        lock_file.unlink()
+        logger.info(f"lock file を削除しました: {lock_file}")
     except OSError as e:
         logger.warning(f"lock file の削除に失敗しました: {e}")
 
