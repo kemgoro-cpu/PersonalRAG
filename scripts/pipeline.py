@@ -732,6 +732,14 @@ def process_audio(
     # この同期は WebUI が起動していない場合でも pipeline を止めない設計にしている。
     # sync に失敗した分は後から「python scripts/sync_webui.py」で回収できる。
     if settings.get("openwebui", {}).get("enabled", False):
+        if state_file is not None:
+            write_state(
+                state_file,
+                current={"file": audio_path.name, "step": "sync_webui", "started_at": _now_iso()},
+                queue=queue,
+                recent=recent,
+                logger=logger,
+            )
         if not run_step("sync_webui.py", [str(note_path)], logger):
             logger.warning(
                 f"Open WebUI 同期失敗（後で sync_webui.py で回収可能）: {note_path.name}"
@@ -1106,6 +1114,14 @@ def process_text(
     # Step 5: Open WebUI Knowledge への自動同期（任意・失敗しても続行）
     # 音声フローと同じ設計。WebUI が停止中でも pipeline は完走する。
     if settings.get("openwebui", {}).get("enabled", False):
+        if state_file is not None:
+            write_state(
+                state_file,
+                current={"file": text_path.name, "step": "sync_webui", "started_at": _now_iso()},
+                queue=queue,
+                recent=recent,
+                logger=logger,
+            )
         if not run_step("sync_webui.py", [str(note_path)], logger):
             logger.warning(
                 f"Open WebUI 同期失敗（後で sync_webui.py で回収可能）: {note_path.name}"

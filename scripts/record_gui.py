@@ -240,219 +240,299 @@ class RecordingApp:
     # GUI 構築
     # ------------------------------------------------------------------
 
-    def _build_window(self) -> None:
-        """tkinter のウィジェット配置。ttk.Notebook でタブ化する。
+    def _configure_styles(self) -> None:
+        """ttk の見た目をアプリ用に整える。
 
-        タブ 1「録音」: 既存の録音 UI + パイプライン状態セクション
-        タブ 2「サービス管理」: Ollama / Pipeline / Open WebUI の状態と操作
+        追加ライブラリを使わず、会社 PC でも動く範囲で余白・色・強調だけを整える。
         """
-        # Notebook（タブコンテナ）をルートウィンドウに配置
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=4, pady=4)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
 
-        # --- タブ 1: 録音 ---
-        recording_tab = ttk.Frame(notebook, padding=16)
-        notebook.add(recording_tab, text="録音")
-        self._build_recording_tab(recording_tab)
+        base_font = ("Yu Gothic UI", 10)
+        title_font = ("Yu Gothic UI", 18, "bold")
+        section_font = ("Yu Gothic UI", 11, "bold")
+        status_font = ("Yu Gothic UI", 14, "bold")
+        small_font = ("Yu Gothic UI", 9)
 
-        # --- タブ 2: サービス管理 ---
-        service_tab = ttk.Frame(notebook, padding=16)
-        notebook.add(service_tab, text="サービス管理")
-        self._build_service_tab(service_tab)
+        style.configure(".", font=base_font)
+        style.configure("App.TFrame", background="#f6f7fb")
+        style.configure("Surface.TFrame", background="#ffffff", relief="solid", borderwidth=1)
+        style.configure("Header.TLabel", background="#f6f7fb", foreground="#111827", font=title_font)
+        style.configure("Subtle.TLabel", background="#f6f7fb", foreground="#6b7280", font=small_font)
+        style.configure("Surface.TLabel", background="#ffffff", foreground="#111827")
+        style.configure("Section.TLabel", background="#ffffff", foreground="#111827", font=section_font)
+        style.configure("Status.TLabel", background="#ffffff", foreground="#111827", font=status_font)
+        style.configure("Hint.TLabel", background="#ffffff", foreground="#6b7280", font=small_font)
+        style.configure("DangerHint.TLabel", background="#ffffff", foreground="#b42318", font=small_font)
+        style.configure("Primary.TButton", font=("Yu Gothic UI", 12, "bold"), padding=(12, 10))
+        style.configure("Secondary.TButton", padding=(10, 6))
+        style.configure("ServiceCard.TFrame", background="#ffffff", relief="solid", borderwidth=1)
+        style.configure("StepPending.TLabel", background="#eef0f4", foreground="#6b7280", padding=(8, 5))
+        style.configure("StepActive.TLabel", background="#dbeafe", foreground="#1d4ed8", padding=(8, 5))
+        style.configure("StepDone.TLabel", background="#dcfce7", foreground="#166534", padding=(8, 5))
+        style.configure("StepError.TLabel", background="#fee2e2", foreground="#b42318", padding=(8, 5))
+        style.configure("Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#2563eb")
+
+    def _build_window(self) -> None:
+        """tkinter のウィジェット配置。
+
+        録音、パイプライン、サービス状態を 1 画面にまとめる。
+        詳細一覧や隔離ファイル操作は既存のダイアログをそのまま使う。
+        """
+        self._configure_styles()
+        self.root.geometry("760x660")
+        self.root.minsize(700, 600)
+        self.root.resizable(True, True)
+
+        root_frame = ttk.Frame(self.root, style="App.TFrame", padding=16)
+        root_frame.pack(fill="both", expand=True)
+        root_frame.columnconfigure(0, weight=1)
+        root_frame.columnconfigure(1, weight=1)
+        root_frame.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(root_frame, style="App.TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="PersonalRAG", style="Header.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            header,
+            text=f"完全ローカル録音・要約・検索  /  ホットキー: {self.hotkey.upper()}",
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        recording_panel = ttk.Frame(root_frame, style="Surface.TFrame", padding=14)
+        recording_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
+        self._build_recording_tab(recording_panel)
+
+        service_panel = ttk.Frame(root_frame, style="Surface.TFrame", padding=14)
+        service_panel.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 12))
+        self._build_service_tab(service_panel)
+
+        pipeline_panel = ttk.Frame(root_frame, style="Surface.TFrame", padding=14)
+        pipeline_panel.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        self._build_pipeline_panel(pipeline_panel)
 
         # ×ボタンの挙動: 完全終了せずトレイへ収納（トレイが無ければ確認の上で完全終了）
         self.root.protocol("WM_DELETE_WINDOW", self._on_minimize_to_tray)
 
     def _build_recording_tab(self, frame: ttk.Frame) -> None:
-        """「録音」タブのウィジェットを配置する（既存の録音 UI）。"""
-        # マイクデバイス選択
-        ttk.Label(frame, text="マイクデバイス").grid(row=0, column=0, sticky="w")
-        self.device_var = tk.StringVar()
-        self.device_combobox = ttk.Combobox(
-            frame, textvariable=self.device_var, state="readonly", width=56
+        """録音コックピットを配置する。"""
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text="録音", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
         )
-        self.device_combobox.grid(row=1, column=0, columnspan=2, sticky="we", pady=(4, 12))
-        self._refresh_devices()
 
-        # トグルボタン（一番目立たせる）
+        self.status_var = tk.StringVar(value="待機中")
+        self.status_label = ttk.Label(frame, textvariable=self.status_var, style="Status.TLabel")
+        self.status_label.grid(row=1, column=0, sticky="w", pady=(8, 10))
+
         self.toggle_button = ttk.Button(
             frame,
-            text="● 録音開始",
+            text="録音開始",
             command=lambda: self.command_queue.put(COMMAND_TOGGLE),
+            style="Primary.TButton",
         )
-        self.toggle_button.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        self.toggle_button.grid(row=2, column=0, sticky="we", pady=(0, 12))
 
-        # ステータス
-        self.status_var = tk.StringVar(value="待機中")
-        self.status_label = ttk.Label(frame, textvariable=self.status_var, font=("", 11))
-        self.status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        # マイクデバイス選択
+        ttk.Label(frame, text="マイクデバイス", style="Surface.TLabel").grid(
+            row=3, column=0, sticky="w"
+        )
+        self.device_var = tk.StringVar()
+        self.device_combobox = ttk.Combobox(
+            frame, textvariable=self.device_var, state="readonly"
+        )
+        self.device_combobox.grid(row=4, column=0, sticky="we", pady=(4, 12))
+        self._refresh_devices()
 
-        # 保存先パス（小さく表示）＋「📁 変更...」ボタン
-        # wraplength=480: ウィンドウ幅 520 から左右の余白を引いた値。
-        # 長いパス（NAS の UNC パスや日本語入りパス）が切れずに改行表示される。
-        ttk.Label(frame, text="保存先:", foreground="#666").grid(row=4, column=0, sticky="w")
+        ttk.Label(frame, text="保存先", style="Surface.TLabel").grid(
+            row=5, column=0, sticky="w"
+        )
         self.path_var = tk.StringVar(value=str(self.recordings_dir))
         ttk.Label(
-            frame, textvariable=self.path_var, foreground="#666", wraplength=480
-        ).grid(row=4, column=1, sticky="w")
-        # 「📁 変更...」ボタン: フォルダ選択ダイアログで録音保存先を変更する
-        ttk.Button(
             frame,
-            text="📁 変更...",
+            textvariable=self.path_var,
+            style="Hint.TLabel",
+            wraplength=320,
+        ).grid(row=6, column=0, sticky="w", pady=(4, 8))
+
+        button_row = ttk.Frame(frame, style="Surface.TFrame")
+        button_row.grid(row=7, column=0, sticky="we")
+        button_row.columnconfigure(0, weight=1)
+        button_row.columnconfigure(1, weight=1)
+        ttk.Button(
+            button_row,
+            text="保存先変更",
             command=self._on_change_recordings_dir,
-            width=10,
-        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
-
-        # 「ノートを開く」ボタン（フェーズ D: ノートビューアを起動）
+            style="Secondary.TButton",
+        ).grid(row=0, column=0, sticky="we", padx=(0, 6))
         ttk.Button(
-            frame,
-            text="📖 ノートを開く",
+            button_row,
+            text="ノートを開く",
             command=self._open_note_viewer,
-            width=18,
-        ).grid(row=5, column=1, sticky="w", pady=(4, 0))
+            style="Secondary.TButton",
+        ).grid(row=0, column=1, sticky="we", padx=(6, 0))
 
-        # ホットキー表示
+    def _build_pipeline_panel(self, frame: ttk.Frame) -> None:
+        """パイプラインの処理進捗を見える化する。"""
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text="パイプライン進捗", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+
+        self._pipeline_current_var = tk.StringVar(value="待機中")
+        self._pipeline_current_label = ttk.Label(
+            frame, textvariable=self._pipeline_current_var, style="Status.TLabel"
+        )
+        self._pipeline_current_label.grid(row=1, column=0, sticky="w", pady=(8, 8))
+
+        self._pipeline_progressbar = ttk.Progressbar(
+            frame, mode="indeterminate", style="Horizontal.TProgressbar"
+        )
+        self._pipeline_progressbar.grid(row=2, column=0, sticky="we", pady=(0, 12))
+        self._pipeline_progress_active = False
+
+        steps_frame = ttk.Frame(frame, style="Surface.TFrame")
+        steps_frame.grid(row=3, column=0, sticky="we")
+        for column_index in range(5):
+            steps_frame.columnconfigure(column_index, weight=1)
+        self._pipeline_steps = [
+            ("transcribe", "文字起こし"),
+            ("summarize", "要約"),
+            ("ingest", "ChromaDB"),
+            ("sync_webui", "WebUI同期"),
+            ("done", "完了"),
+        ]
+        self._pipeline_step_labels: dict[str, ttk.Label] = {}
+        for col, (step, label_text) in enumerate(self._pipeline_steps):
+            label = ttk.Label(
+                steps_frame,
+                text=label_text,
+                anchor="center",
+                style="StepPending.TLabel",
+            )
+            label.grid(row=0, column=col, sticky="we", padx=(0 if col == 0 else 6, 0))
+            self._pipeline_step_labels[step] = label
+
+        self._pipeline_recent_var = tk.StringVar(value="最近の処理: — 件")
+        ttk.Label(frame, textvariable=self._pipeline_recent_var, style="Hint.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(12, 0)
+        )
+
+        self._pipeline_events_var = tk.StringVar(value="最近のイベント: —")
         ttk.Label(
             frame,
-            text=f"ホットキー: {self.hotkey.upper()}（settings.yaml で変更可）",
-            foreground="#888",
-            font=("", 9),
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            textvariable=self._pipeline_events_var,
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=700,
+        ).grid(row=5, column=0, sticky="we", pady=(6, 0))
 
-        # --- パイプライン状態セクション（フェーズ A 成果物をここに残す）---
-        ttk.Separator(frame, orient="horizontal").grid(
-            row=7, column=0, columnspan=2, sticky="we", pady=(12, 8)
-        )
-        ttk.Label(frame, text="パイプライン状態", font=("", 10, "bold")).grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(0, 2)
-        )
-
-        # 現在処理中のファイル表示
-        # _pipeline_current_label: _update_pipeline_status() から foreground を変更するために保持
-        self._pipeline_current_var = tk.StringVar(value="待機中")
-        ttk.Label(frame, text="現在:").grid(row=9, column=0, sticky="w", pady=(4, 0))
-        self._pipeline_current_label = ttk.Label(
-            frame, textvariable=self._pipeline_current_var, foreground="#333"
-        )
-        self._pipeline_current_label.grid(row=9, column=1, sticky="w", pady=(4, 0))
-
-        # 直近 24 時間の成功/失敗カウント表示
-        self._pipeline_recent_var = tk.StringVar(value="最近の処理: — 件")
-        ttk.Label(frame, textvariable=self._pipeline_recent_var, foreground="#555").grid(
-            row=10, column=0, columnspan=2, sticky="w", pady=(2, 0)
-        )
-
-        # 詳細ボタン（直近の処理一覧を Toplevel で表示）
+        action_row = ttk.Frame(frame, style="Surface.TFrame")
+        action_row.grid(row=6, column=0, sticky="w", pady=(12, 0))
         ttk.Button(
-            frame, text="詳細...", command=self._show_pipeline_detail, width=8
-        ).grid(row=11, column=0, sticky="w", pady=(6, 0))
+            action_row,
+            text="処理詳細",
+            command=self._show_pipeline_detail,
+            style="Secondary.TButton",
+        ).pack(side="left", padx=(0, 8))
 
-        # 「失敗一覧」ボタン（隔離済みファイルを一覧・再試行・削除できるダイアログを開く）
-        # 件数は _tick() が 5 秒おきに更新する
         self._failed_files_btn = ttk.Button(
-            frame,
+            action_row,
             text="隔離ファイル (0)",
             command=self._show_failed_files_dialog,
-            width=14,
+            style="Secondary.TButton",
         )
-        self._failed_files_btn.grid(row=11, column=1, sticky="w", pady=(6, 0))
+        self._failed_files_btn.pack(side="left")
 
-        # 凡例: 「最近の処理 ✗ N 件」と「隔離ファイル (N)」の区別をユーザーに案内する
-        # 1 回失敗しただけのファイルは retry_count.json に積まれて再試行され、
-        # 連続失敗が retry_max (デフォルト 3) に到達したら failed/ に隔離される
         ttk.Label(
             frame,
             text="（連続失敗が 3 回に達したファイルが「隔離ファイル」として一覧表示されます）",
-            font=("", 8),
-            foreground="#666",
-        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
-
-        frame.columnconfigure(1, weight=1)
+            style="Hint.TLabel",
+        ).grid(row=7, column=0, sticky="w", pady=(6, 0))
 
     def _build_service_tab(self, frame: ttk.Frame) -> None:
-        """「サービス管理」タブのウィジェットを配置する。
+        """サービス管理カードを配置する。
 
-        レイアウト:
-            サービス名ラベル + 状態インジケータ（●=稼働 / ○=停止）+ 詳細テキスト + 個別ボタン
-            「すべて起動」「すべて停止」ボタン
-            VRAM 競合警告ラベル（常時赤字表示）
+        外部起動のサービスも状態が読み取りやすいよう、1 サービス 1 カードにする。
         """
-        # 各サービスの行を構築するヘルパー
         SERVICE_NAMES = ["Ollama", "Pipeline", "Open WebUI"]
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text="サービス", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
 
-        for row_idx, name in enumerate(SERVICE_NAMES):
-            # サービス名ラベル
-            ttk.Label(frame, text=f"{name}:", width=12, anchor="w").grid(
-                row=row_idx, column=0, sticky="w", pady=4
+        for row_idx, name in enumerate(SERVICE_NAMES, start=1):
+            card = ttk.Frame(frame, style="ServiceCard.TFrame", padding=10)
+            card.grid(row=row_idx, column=0, sticky="we", pady=(0, 8))
+            card.columnconfigure(1, weight=1)
+
+            ttk.Label(card, text=name, style="Surface.TLabel", font=("Yu Gothic UI", 10, "bold")).grid(
+                row=0, column=0, sticky="w"
             )
-            # 状態インジケータ（● 稼働中 / ○ 停止中）
-            status_label = ttk.Label(frame, text="○ 停止中", foreground="#888", width=12)
-            status_label.grid(row=row_idx, column=1, sticky="w", pady=4)
+            status_label = ttk.Label(card, text="○ 停止中", style="Hint.TLabel")
+            status_label.grid(row=0, column=1, sticky="e")
 
-            # 詳細テキスト（"稼働中" / "停止中" / "停止中（状態ファイルなし）" 等）
-            detail_label = ttk.Label(frame, text="確認中...", foreground="#aaa", width=22)
-            detail_label.grid(row=row_idx, column=2, sticky="w", pady=4)
+            detail_label = ttk.Label(
+                card,
+                text="確認中...",
+                style="Hint.TLabel",
+                wraplength=220,
+            )
+            detail_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 8))
 
-            # 個別操作ボタン（状態に応じて「起動」⇔「停止」を切替）
-            # lambda でループ変数をキャプチャするため default 引数で束縛する
             btn = ttk.Button(
-                frame,
+                card,
                 text="起動",
-                width=8,
+                style="Secondary.TButton",
                 command=lambda n=name: self._on_service_button(n),
             )
-            btn.grid(row=row_idx, column=3, sticky="w", padx=(8, 0), pady=4)
+            btn.grid(row=2, column=0, columnspan=2, sticky="we")
 
-            # ウィジェット参照を保存（_update_service_tab で更新するため）
             self._service_widgets[name] = {
                 "status_label": status_label,
                 "detail_label": detail_label,
                 "button": btn,
             }
 
-        # セパレータ
-        ttk.Separator(frame, orient="horizontal").grid(
-            row=len(SERVICE_NAMES), column=0, columnspan=4,
-            sticky="we", pady=(12, 8)
-        )
+        bulk_frame = ttk.Frame(frame, style="Surface.TFrame")
+        bulk_frame.grid(row=len(SERVICE_NAMES) + 1, column=0, sticky="we", pady=(2, 0))
+        bulk_frame.columnconfigure(0, weight=1)
+        bulk_frame.columnconfigure(1, weight=1)
 
-        # 「すべて起動」「すべて停止」ボタン行
-        bulk_frame = ttk.Frame(frame)
-        bulk_frame.grid(row=len(SERVICE_NAMES) + 1, column=0, columnspan=4, sticky="w")
-
-        # ボタンを self に保持して、連打防止のため disable/enable を後から制御する
         self._start_all_btn = ttk.Button(
             bulk_frame,
             text="すべて起動",
-            width=12,
             command=self._on_start_all_services,
+            style="Secondary.TButton",
         )
-        self._start_all_btn.pack(side="left", padx=(0, 8))
+        self._start_all_btn.grid(row=0, column=0, sticky="we", padx=(0, 6))
 
         self._stop_all_btn = ttk.Button(
             bulk_frame,
             text="すべて停止",
-            width=12,
             command=self._on_stop_all_services,
+            style="Secondary.TButton",
         )
-        self._stop_all_btn.pack(side="left")
+        self._stop_all_btn.grid(row=0, column=1, sticky="we", padx=(6, 0))
 
-        # VRAM 競合警告ラベル（常時赤字）
         ttk.Label(
             frame,
             text=(
-                "注意: 文字起こし中に Open WebUI でチャットすると、Ollama/Gemma と\n"
+                "注意: 文字起こし中に Open WebUI でチャットすると、Ollama/Gemma と "
                 "Whisper が VRAM を奪い合う恐れがあります。チャット前に Pipeline を停止してください。"
             ),
-            foreground="red",
-            font=("", 9),
+            style="DangerHint.TLabel",
             justify="left",
+            wraplength=330,
         ).grid(
-            row=len(SERVICE_NAMES) + 2, column=0, columnspan=4,
-            sticky="w", pady=(16, 0)
+            row=len(SERVICE_NAMES) + 2, column=0, sticky="w", pady=(12, 0)
         )
-
-        frame.columnconfigure(2, weight=1)
 
     def _refresh_devices(self) -> None:
         """入力デバイス一覧を Combobox に流し込む。"""
@@ -820,7 +900,7 @@ class RecordingApp:
         self.silence_announced = False
 
         # UI 更新
-        self.toggle_button.config(text="■ 録音停止")
+        self.toggle_button.config(text="録音停止")
         self.device_combobox.config(state="disabled")
         self.status_var.set("録音中  00:00:00")
         self.status_label.config(foreground="black")
@@ -842,7 +922,7 @@ class RecordingApp:
             saved = self.current_output
 
         self.state = AppState.IDLE
-        self.toggle_button.config(text="● 録音開始")
+        self.toggle_button.config(text="録音開始")
         self.device_combobox.config(state="readonly")
         self.status_label.config(foreground="black")
 
@@ -905,7 +985,7 @@ class RecordingApp:
         except Exception:
             pass
         self.state = AppState.IDLE
-        self.toggle_button.config(text="● 録音開始")
+        self.toggle_button.config(text="録音開始")
         self.device_combobox.config(state="readonly")
         self.status_var.set("待機中")
         self.status_label.config(foreground="black")
@@ -930,22 +1010,28 @@ class RecordingApp:
                 self._pipeline_current_var.set("Pipeline 停止中（状態ファイルなし）")
                 self._pipeline_current_label.config(foreground="#cc0000")
                 self._pipeline_recent_var.set("最近の処理: —")
+                self._pipeline_events_var.set("最近のイベント: —")
+                self._set_pipeline_progress(False)
+                self._set_pipeline_steps(active_step=None, error=True)
                 return
 
             text = self._pipeline_state_file.read_text(encoding="utf-8")
             data = json.loads(text)
+            recent = data.get("recent", [])
 
             pipeline_info = self.service_manager.check_pipeline()
             if pipeline_info.status != ServiceStatus.RUNNING:
                 # 停止中の表示（赤系で目立たせる）
                 self._pipeline_current_var.set(f"Pipeline {pipeline_info.detail}")
                 self._pipeline_current_label.config(foreground="#cc0000")
+                self._set_pipeline_progress(False)
+                self._set_pipeline_steps(active_step=None, error=True)
                 # 停止中でも recent は読めるなら表示する
-                recent = data.get("recent", [])
                 if recent:
                     self._update_pipeline_recent_count(recent)
                 else:
                     self._pipeline_recent_var.set("最近の処理: —")
+                self._update_pipeline_events(recent)
                 return
 
             # --- Pipeline 稼働中 ---
@@ -958,22 +1044,117 @@ class RecordingApp:
                     "transcribe": "文字起こし中",
                     "summarize": "要約中",
                     "ingest": "DB 投入中",
+                    "sync_webui": "Open WebUI 同期中",
                 }.get(current.get("step", ""), current.get("step", "処理中"))
+                elapsed = self._format_started_elapsed(current.get("started_at", ""))
+                elapsed_text = f"  /  経過 {elapsed}" if elapsed else ""
                 self._pipeline_current_var.set(
-                    f"{current.get('file', '')}  ({step_label})"
+                    f"{current.get('file', '')}  ({step_label}){elapsed_text}"
                 )
+                self._set_pipeline_progress(True)
+                self._set_pipeline_steps(active_step=current.get("step"))
             else:
-                self._pipeline_current_var.set("待機中（pipeline 稼働中）")
+                queue_len = len(data.get("queue", []))
+                self._pipeline_current_var.set(f"待機中（Pipeline 稼働中） / 待ち {queue_len} 件")
+                self._set_pipeline_progress(False)
+                latest_result = recent[-1].get("result") if recent else None
+                if latest_result == "success":
+                    self._set_pipeline_steps(active_step="done")
+                elif latest_result == "failed":
+                    self._set_pipeline_steps(active_step=None, error=True)
+                else:
+                    self._set_pipeline_steps(active_step=None)
 
             # 直近 24 時間の成功/失敗カウント
-            recent = data.get("recent", [])
             self._update_pipeline_recent_count(recent)
+            self._update_pipeline_events(recent)
 
         except Exception:
             # ファイル読み込み失敗・JSON 壊れ等は全て無視してフォールバック
             self._pipeline_current_var.set("Pipeline 停止中（状態ファイル読み込み失敗）")
             self._pipeline_current_label.config(foreground="#cc0000")
             self._pipeline_recent_var.set("最近の処理: — （読み込み失敗）")
+            self._pipeline_events_var.set("最近のイベント: 状態ファイルを読み込めませんでした")
+            self._set_pipeline_progress(False)
+            self._set_pipeline_steps(active_step=None, error=True)
+
+    def _set_pipeline_progress(self, active: bool) -> None:
+        """処理中だけプログレスバーを動かす。"""
+        progressbar = getattr(self, "_pipeline_progressbar", None)
+        if progressbar is None:
+            return
+
+        if active and not getattr(self, "_pipeline_progress_active", False):
+            progressbar.start(12)
+            self._pipeline_progress_active = True
+        elif not active and getattr(self, "_pipeline_progress_active", False):
+            progressbar.stop()
+            self._pipeline_progress_active = False
+            progressbar["value"] = 0
+
+    def _set_pipeline_steps(self, active_step: str | None, error: bool = False) -> None:
+        """現在のパイプラインステップをバッジ表示へ反映する。"""
+        labels = getattr(self, "_pipeline_step_labels", {})
+        if not labels:
+            return
+
+        order = [step for step, _label in self._pipeline_steps]
+        active_index = order.index(active_step) if active_step in order else -1
+
+        for index, step in enumerate(order):
+            label = labels.get(step)
+            if label is None:
+                continue
+
+            if error:
+                style = "StepError.TLabel" if step == "transcribe" else "StepPending.TLabel"
+            elif active_index == -1:
+                style = "StepPending.TLabel"
+            elif index < active_index:
+                style = "StepDone.TLabel"
+            elif index == active_index:
+                style = "StepDone.TLabel" if step == "done" else "StepActive.TLabel"
+            else:
+                style = "StepPending.TLabel"
+            label.config(style=style)
+
+    def _format_started_elapsed(self, started_at_str: str) -> str:
+        """started_at から経過時間の短い表示を作る。"""
+        if not started_at_str:
+            return ""
+        try:
+            started_at = datetime.fromisoformat(started_at_str)
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            elapsed = int((datetime.now(timezone.utc) - started_at).total_seconds())
+            if elapsed < 0:
+                elapsed = 0
+            return time.strftime("%H:%M:%S", time.gmtime(elapsed))
+        except Exception:
+            return ""
+
+    def _update_pipeline_events(self, recent: list[dict[str, Any]]) -> None:
+        """直近の処理結果を短いイベントログとして表示する。"""
+        if not recent:
+            self._pipeline_events_var.set("最近のイベント: —")
+            return
+
+        lines: list[str] = []
+        for entry in list(recent)[-4:][::-1]:
+            finished_at = entry.get("finished_at", "")
+            try:
+                dt = datetime.fromisoformat(finished_at)
+                time_text = dt.astimezone().strftime("%H:%M")
+            except Exception:
+                time_text = "--:--"
+
+            result_text = "完了" if entry.get("result") == "success" else "失敗"
+            detail = entry.get("error") or entry.get("note_path") or ""
+            if detail:
+                detail = f"  /  {Path(str(detail)).name}"
+            lines.append(f"{time_text}  {result_text}: {entry.get('file', '')}{detail}")
+
+        self._pipeline_events_var.set("最近のイベント:\n" + "\n".join(lines))
 
     def _update_pipeline_recent_count(self, recent: list) -> None:
         """直近 24 時間の成功/失敗件数 + 現在リトライ中の件数を集計して
