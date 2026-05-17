@@ -178,16 +178,30 @@ source .venv/Scripts/activate
 
 #### 2. PyTorch (CUDA 版) をインストール
 
-CUDA 12.1 用ホイールを先に入れる（faster-whisper / pyannote が依存）。
+PyTorch は GPU 世代に合わせた CUDA wheel を先に入れる（faster-whisper / pyannote が依存）。
+
+**開発機 (RTX 3060 / Ampere):**
 
 ```powershell
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+**本番機 (RTX Pro 2000 Blackwell):**
+
+```powershell
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
 #### 3. 残りの依存ライブラリ
 
 ```powershell
 pip install -r requirements.txt
+```
+
+Open WebUI は別 venv に検証済みバージョンを入れる。
+
+```powershell
+.\.venv-webui\Scripts\python.exe -m pip install open-webui==0.9.5
 ```
 
 #### 4. Ollama インストール & モデル取得

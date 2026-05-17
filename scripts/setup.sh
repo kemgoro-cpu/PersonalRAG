@@ -123,8 +123,16 @@ info "※ファイルサイズが大きいため時間がかかります（数�
 #       直接パス指定のほうがスクリプトとして安全で明示的
 # -m pip: pip を直接呼ばず python 経由で実行することで、
 #         PATH の状況に関わらず必ず .venv 内の pip が使われることを保証する
-# --index-url: PyTorch 公式の CUDA 12.1 用ホイール配布サーバーから取得する指定
-./.venv/Scripts/python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# --index-url: PyTorch 公式の CUDA 用ホイール配布サーバーから取得する指定
+# dev は RTX 3060 の既存実績を優先して CUDA 12.1、prod は Blackwell 世代に合わせて CUDA 12.8 を使う。
+if [[ "$PROFILE" == "prod" ]]; then
+    TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
+    info "本番機用 PyTorch wheel（CUDA 12.8）を使います。"
+else
+    TORCH_INDEX_URL="https://download.pytorch.org/whl/cu121"
+    info "開発機用 PyTorch wheel（CUDA 12.1）を使います。"
+fi
+./.venv/Scripts/python.exe -m pip install torch torchaudio --index-url "$TORCH_INDEX_URL"
 
 # =============================================================================
 # Step 7/12: requirements.txt の依存ライブラリをインストール
@@ -157,7 +165,9 @@ fi
 info "Step 9/12: open-webui をインストールしています..."
 info "※初回は時間がかかります（数分）"
 
-./.venv-webui/Scripts/python.exe -m pip install open-webui
+OPEN_WEBUI_VERSION="0.9.5"
+info "検証済みバージョン open-webui==${OPEN_WEBUI_VERSION} をインストールします。"
+./.venv-webui/Scripts/python.exe -m pip install "open-webui==${OPEN_WEBUI_VERSION}"
 
 info "Open WebUI のインストール完了"
 

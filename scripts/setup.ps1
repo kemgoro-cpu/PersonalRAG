@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # PersonalRAG セットアップスクリプト（PowerShell 用）
 #
 # 使い方:
@@ -21,10 +21,6 @@
 #   7. 残り手動作業の案内表示
 # =============================================================================
 
-# $ErrorActionPreference = "Stop": エラーが起きたら即座に停止する設定
-# これがないと、エラーが起きても次の処理に進んでしまう恐れがある
-$ErrorActionPreference = "Stop"
-
 # =============================================================================
 # 引数定義
 # ValidateSet: "dev" か "prod" 以外が渡されると PowerShell が自動でエラーを出す
@@ -34,6 +30,12 @@ param(
     [ValidateSet("dev", "prod")]
     [string]$Profile = "dev"
 )
+
+# $ErrorActionPreference = "Stop": エラーが起きたら即座に停止する設定
+# これがないと、エラーが起きても次の処理に進んでしまう恐れがある
+# PowerShell の param ブロックはスクリプト先頭に置く必要があるため、
+# 代入は param の後に行う。
+$ErrorActionPreference = "Stop"
 
 # =============================================================================
 # 進捗ログ用ヘルパー関数
@@ -115,8 +117,16 @@ Write-Info "※ファイルサイズが大きいため時間がかかります�
 # activate を使わず直接 .venv の pip を呼ぶ
 # 理由: Activate.ps1 を実行すると現在のシェル環境を変えてしまうことがあり、
 #       直接パス指定のほうがスクリプトとして安全で明示的
-# --index-url: PyTorch 公式の CUDA 12.1 用ホイール配布サーバーから取得する指定
-& .\.venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# --index-url: PyTorch 公式の CUDA 用ホイール配布サーバーから取得する指定
+# dev は RTX 3060 の既存実績を優先して CUDA 12.1、prod は Blackwell 世代に合わせて CUDA 12.8 を使う。
+if ($Profile -eq "prod") {
+    $TorchIndexUrl = "https://download.pytorch.org/whl/cu128"
+    Write-Info "本番機用 PyTorch wheel（CUDA 12.8）を使います。"
+} else {
+    $TorchIndexUrl = "https://download.pytorch.org/whl/cu121"
+    Write-Info "開発機用 PyTorch wheel（CUDA 12.1）を使います。"
+}
+& .\.venv\Scripts\python.exe -m pip install torch torchaudio --index-url $TorchIndexUrl
 
 # =============================================================================
 # Step 7/12: requirements.txt の依存ライブラリをインストール
@@ -149,7 +159,9 @@ if (-not (Test-Path ".venv-webui")) {
 Write-Info "Step 9/12: open-webui をインストールしています..."
 Write-Info "※初回は時間がかかります（数分）"
 
-& .\.venv-webui\Scripts\python.exe -m pip install open-webui
+$OpenWebUIVersion = "0.9.5"
+Write-Info "検証済みバージョン open-webui==$OpenWebUIVersion をインストールします。"
+& .\.venv-webui\Scripts\python.exe -m pip install "open-webui==$OpenWebUIVersion"
 
 Write-Info "Open WebUI のインストール完了"
 
