@@ -13,7 +13,7 @@ scripts/record_mic.py の CLI 版と同じ Recorder クラス（scripts/recorder
     - タイトルをファイル名とサイドカー meta.json に反映する
     - 10秒間連続で無音を検知したらステータス赤字表示 + 一度だけ通知ダイアログ
     - 保存先は config/settings.yaml の paths.recordings_dir (NAS の UNC パス可)
-    - サービス管理タブで Ollama / Pipeline / Open WebUI を起動・停止・状態確認
+    - サービス管理カードで Ollama / Pipeline / Open WebUI を起動・停止・状態確認
 
 スレッド構成:
     main              : tkinter mainloop（ウィジェット操作はすべてここから）
@@ -144,7 +144,7 @@ class RecordingApp:
         self._failed_count_last_read: float = 0.0
         # 現在の隔離済みファイル件数（ボタンラベルに表示）
         self._failed_count: int = 0
-        # 「失敗一覧」ボタンのウィジェット参照（_update_failed_count_label で更新）
+        # 「隔離ファイル」ボタンのウィジェット参照（_update_failed_count_label で更新）
         self._failed_files_btn: Any = None
 
         # --- 録音エンジン ---
@@ -186,7 +186,7 @@ class RecordingApp:
         self._service_poll_thread.start()
         self.service_manager.start_notes_auto_sync()
 
-        # サービスタブのウィジェット参照（_build_window で設定する）
+        # サービス管理カードのウィジェット参照（_build_window で設定する）
         # 各行: {"status_label": Label, "detail_label": Label, "button": Button}
         self._service_widgets: dict[str, dict[str, Any]] = {}
 
@@ -708,12 +708,12 @@ class RecordingApp:
             self._pipeline_state_last_read = now
             self._update_pipeline_status()
 
-        # 4-b) 失敗一覧の件数を 5 秒おきに更新してボタンラベルに反映する
+        # 4-b) 隔離ファイルの件数を 5 秒おきに更新してボタンラベルに反映する
         if now - self._failed_count_last_read >= 5.0:
             self._failed_count_last_read = now
             self._update_failed_count_label()
 
-        # 5) サービス管理タブの表示更新（ロック取得 → キャッシュ参照 → 即解放）
+        # 5) サービス管理カードの表示更新（ロック取得 → キャッシュ参照 → 即解放）
         #    I/O なし・ロック保持時間は数マイクロ秒なので freeze の心配なし
         with self._service_status_lock:
             cache_snapshot = dict(self._service_status_cache)
@@ -1218,7 +1218,7 @@ class RecordingApp:
             return 0
 
     # ------------------------------------------------------------------
-    # サービス管理タブの表示更新とボタン操作
+    # サービス管理カードの表示更新とボタン操作
     # ------------------------------------------------------------------
 
     def _create_tooltip(self, widget: Any, text: str) -> None:
@@ -1308,7 +1308,7 @@ class RecordingApp:
             self._create_tooltip(widget, text)
 
     def _update_service_tab(self, cache: dict[str, ServiceInfo]) -> None:
-        """サービス管理タブの各行ウィジェットをキャッシュの内容で更新する。
+        """サービス管理カードの各行ウィジェットをキャッシュの内容で更新する。
 
         この関数は _tick() から main スレッドで呼ばれる。
         ウィジェットが未作成の場合（起動直後）は何もしない。
@@ -1580,7 +1580,7 @@ class RecordingApp:
             )
 
     def _on_change_recordings_dir(self) -> None:
-        """「📁 変更...」ボタン: フォルダ選択ダイアログで録音保存先を変更する。
+        """「保存先変更」ボタン: フォルダ選択ダイアログで録音保存先を変更する。
 
         選択されたパスを settings.yaml の paths.recordings_dir に書き戻す。
         書き戻し後は GUI の再起動を促す（即時反映はしない）。

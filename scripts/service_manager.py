@@ -801,7 +801,7 @@ class ServiceManager:
             return False, (
                 f"open-webui.exe が見つかりません: {webui_exe}\n"
                 ".venv-webui に Open WebUI をインストールしてください。\n"
-                "例: python -m venv .venv-webui && .venv-webui\\Scripts\\pip install open-webui"
+                "例: python -m venv .venv-webui && .venv-webui\\Scripts\\pip install open-webui==0.9.5"
             )
 
         current_info = self.check_open_webui()

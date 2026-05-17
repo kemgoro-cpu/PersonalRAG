@@ -24,7 +24,7 @@ PersonalRAG/
 │   │   └── processed/      # 処理済み音声の退避先
 │   ├── input_text/         # テキストファイル投入先（Teams/.vtt/.txt/.md）
 │   │   └── processed/      # 処理済みテキストの退避先
-│   ├── recordings/         # マイク録音の保存先
+│   ├── recordings/         # 旧録音保存先（現在の既定は data/input）
 │   ├── transcripts/        # 文字起こし結果 (.txt)
 │   ├── notes/              # 要約・ToDo (.md)
 │   ├── chromadb/           # ベクター DB の永続化
@@ -38,6 +38,12 @@ PersonalRAG/
 │   ├── ingest_db.py        # Step 3: Markdown → ChromaDB
 │   ├── search.py           # Step 3 動作確認: CLI 検索
 │   ├── pipeline.py         # Step 4: フォルダ監視で全自動化
+│   ├── sync_webui.py       # Step 5: Open WebUI Knowledge 自動同期
+│   ├── service_manager.py  # GUI からの Ollama / Pipeline / Open WebUI 管理
+│   ├── retry_tracker.py    # 失敗ファイルのリトライ回数・隔離履歴管理
+│   ├── note_viewer.py      # Open WebUI 不要の軽量ノートビューア
+│   ├── record_gui.cmd      # 録音 GUI 直接起動用ランチャ
+│   ├── note_viewer.cmd     # ノートビューア直接起動用ランチャ
 │   ├── setup.sh            # セットアップスクリプト（Git Bash 用）
 │   └── setup.ps1           # セットアップスクリプト（PowerShell 用）
 ├── config/
@@ -248,7 +254,7 @@ setx OLLAMA_KEEP_ALIVE "0"
 cd /c/Users/kemgo/Documents/Program/PersonalRAG
 python -m venv .venv-webui
 source .venv-webui/Scripts/activate
-pip install open-webui
+pip install open-webui==0.9.5
 open-webui serve --port 3000
 ```
 
@@ -257,7 +263,7 @@ open-webui serve --port 3000
 cd C:\Users\kemgo\Documents\Program\PersonalRAG
 python -m venv .venv-webui
 .\.venv-webui\Scripts\Activate.ps1
-pip install open-webui
+pip install open-webui==0.9.5
 open-webui serve --port 3000
 ```
 
@@ -349,7 +355,7 @@ pip install -r requirements.txt
 
 ##### 起動
 
-普段はリポジトリ直下の `PersonalRAG.cmd` をダブルクリックします。録音 GUI が開き、録音・ホットキー・トレイ常駐・サービス管理タブをそのまま使えます。
+普段はリポジトリ直下の `PersonalRAG.cmd` をダブルクリックします。録音 GUI が開き、録音・ホットキー・トレイ常駐・サービス管理カードをそのまま使えます。
 
 インストーラや exe 化は不要です。会社 PC ではこのフォルダを置いたまま、`PersonalRAG.cmd` のショートカットだけをデスクトップに作る運用がおすすめです。
 
@@ -467,11 +473,11 @@ recording:
 
 ##### 録音保存先を変更する
 
-録音 GUI の「録音」タブにある「📁 変更...」ボタンから保存先を変更できます。
+録音 GUI の録音カードにある「保存先変更」ボタンから保存先を変更できます。
 
 **GUI から変更する手順**:
 
-1. 録音タブの「保存先:」の右の「📁 変更...」ボタンを押す
+1. 録音カードの「保存先変更」ボタンを押す
 2. フォルダ選択ダイアログが開くので、保存先を選択して「OK」
 3. フォルダが存在しない場合は「作成しますか？」の確認ダイアログが出る
 4. 確認ダイアログで「はい」→ `settings.yaml` への書き込み確認ダイアログが出る（コメント消失の警告あり）
@@ -548,9 +554,9 @@ Open WebUI を起動せずに `data/notes/*.md` を一覧・プレビュー・�
 フェーズ B 以前に作成されたノート（フロントマターなし）も問題なく表示できます。
 この場合、メタ情報欄はすべて「—」になり、ノート本文が全文プレビューされます。
 
-#### B-3. サービス管理タブ
+#### B-3. サービス管理カード
 
-録音 GUI の「サービス管理」タブから、3 つのサービスを一括管理できます。
+録音 GUI 右側のサービス管理カードから、3 つのサービスを一括管理できます。
 
 ```
 ┌─ サービス管理 ────────────────────────────────────────┐
@@ -583,7 +589,7 @@ Open WebUI を起動せずに `data/notes/*.md` を一覧・プレビュー・�
 | Pipeline | `.venv\Scripts\pythonw.exe scripts\pipeline.py`（コンソール非表示） |
 | Open WebUI | `.venv-webui\Scripts\open-webui.exe serve --port 3000` |
 
-Open WebUI をこのタブから起動すると、HTTP 応答が確認できたあとに
+Open WebUI をサービス管理カードから起動すると、HTTP 応答が確認できたあとに
 `scripts\sync_webui.py` をバックグラウンドで 1 回実行し、`data/notes/` の
 未同期 `.md` を Knowledge に回収します。結果は
 `data/logs/sync_webui_stdout.log` / `data/logs/sync_webui_stderr.log` に出力されます。
@@ -602,7 +608,7 @@ GUI 起動中は `data/notes/` も軽く監視しており、新規・更新 `.m
 
 ##### GUI 終了時の挙動
 
-GUI を閉じても、このタブから起動した Pipeline と Open WebUI は **継続します**。
+GUI を閉じても、サービス管理カードから起動した Pipeline と Open WebUI は **継続します**。
 処理を中断されると困るため、意図的にこの仕様にしています。
 
 サービスを停止したい場合は、GUI を閉じる前に「停止」ボタンまたは「すべて停止」を
@@ -634,9 +640,9 @@ pipeline.py は処理に連続失敗したファイルを `data/input/failed/` �
    - トースト通知「✗ 連続失敗のため隔離: <ファイル名>」を表示
 3. 処理が成功した場合はリトライカウントをリセット（0 から再カウント）
 
-##### 「失敗一覧」ダイアログの使い方
+##### 「隔離ファイル」ダイアログの使い方
 
-録音 GUI の「録音」タブ下部に「失敗一覧 (N)」ボタンがあります（N は隔離済み件数）。
+録音 GUI のパイプライン進捗エリアに「隔離ファイル (N)」ボタンがあります（N は隔離済み件数）。
 件数が 0 のときはボタンが非活性になります。
 
 ボタンを押すと以下のダイアログが開きます:
@@ -751,13 +757,13 @@ python scripts/pipeline.py
 python scripts/search.py "先週の会議で決まった納期は？"
 ```
 
-### D. Open WebUI で対話的に質問する
+### D. Open WebUI で対話的に質問する（手動運用）
 
 1. 別ターミナルで `open-webui serve --port 3000` を起動しておく
 2. ブラウザで `http://localhost:3000` を開く
 3. 右上アイコン → Settings → **Connections** → Ollama URL に `http://localhost:11434` を設定（pip 版は同一マシン上で動くので `localhost` で OK）
 4. 左メニュー **Workspace → Knowledge** → 新規 Knowledge を作成
-5. `data/notes/` の `.md` ファイルを **すべてアップロード**（ドラッグ&ドロップ可）
+5. 自動同期をまだ設定していない場合は、`data/notes/` の `.md` ファイルを **すべてアップロード**（ドラッグ&ドロップ可）
 6. 新規チャットで右上の `+` から作成した Knowledge を選択 → 質問
 
 > 自前 ChromaDB と Open WebUI 内蔵 RAG は **並行運用**しています。CLI 検索は自前 DB、チャットは Open WebUI 内蔵 DB を使う形です。
@@ -765,7 +771,7 @@ python scripts/search.py "先週の会議で決まった納期は？"
 ### E. Open WebUI 自動同期（手動アップロード不要にする）
 
 pipeline.py が音声・テキストを処理すると、完了後に自動で WebUI Knowledge にアップロードします。
-Open WebUI が停止していて同期に失敗した分は、次にサービス管理タブから Open WebUI を
+Open WebUI が停止していて同期に失敗した分は、次にサービス管理カードから Open WebUI を
 起動したときにも自動回収されます。
 GUI 起動中に `data/notes/` へ手動で追加・更新した `.md` も、書き込みが安定したあと
 Open WebUI 稼働中なら自動同期されます。
@@ -959,7 +965,7 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
 | `pipeline.py` 停止 → Open WebUI でチャット | ✅ |
 | Open WebUI 未使用時に `pipeline.py` 起動 | ✅ |
 
-**推奨運用**: 仕事中は `pipeline.py` を立ち上げっぱなしにし、Open WebUI でチャットしたい時だけ Ctrl+C で停止する。
+**推奨運用**: 仕事中は `pipeline.py` を立ち上げっぱなしにし、Open WebUI でチャットしたい時だけ GUI の停止ボタンで Pipeline を停止する（CLI で起動している場合は Ctrl+C）。
 
 ---
 

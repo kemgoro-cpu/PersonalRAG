@@ -111,7 +111,7 @@ pipeline:
   cleanup_tmp_on_startup: true
   # --- 失敗ファイル隔離設定 ---
   # この回数連続失敗したファイルを data/input/failed/ に隔離する
-  # 隔離後は record_gui.py の「失敗一覧」ダイアログから再試行または削除できる
+  # 隔離後は record_gui.py の「隔離ファイル」ダイアログから再試行または削除できる
   retry_max: 3
   # リトライ回数を記録するファイル（ファイル単位のカウント・一時的な状態）
   retry_count_file: data/logs/retry_count.json
