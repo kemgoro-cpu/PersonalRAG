@@ -726,6 +726,20 @@ ChromaDB から一時的に消えますが、次回 pipeline 起動時に同じ�
 Teams 会議トランスクリプト（.docx）、iPhone ボイスメモの起こし（.txt）、Zoom 録画のキャプション（.vtt）など、
 既に文字起こし済みのテキストファイルを RAG に取り込めます。
 
+#### 投入先と処理ルート
+
+ユーザーから入ってくるファイルは、種類ごとに投入先が分かれます。
+
+| 入力データ | 投入先 | pipeline での処理 |
+|---|---|---|
+| アプリ録音 / 外部録音（`.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`） | `paths.input_dir` | `transcribe.py` で文字起こし → `summarize.py` で要約 → `ingest_db.py` で ChromaDB 投入 |
+| 書き起こしファイル（`.vtt`, `.docx`, `.txt`） | `paths.input_text_dir` | `import_transcript.py` で正規化 → `summarize.py` で要約 → `ingest_db.py` で ChromaDB 投入 |
+| Markdown / 要約ファイル（`.md`） | `paths.input_text_dir` | Markdown 本文として取り込み → 再要約 → ChromaDB 投入 |
+
+`paths.notes_dir` に直接 `.md` を置いた場合、Open WebUI Knowledge 同期の対象にはなりますが、
+pipeline の「再要約 → ChromaDB 投入」ルートには入りません。既存の要約 `.md` も通常は
+`paths.input_text_dir` に投入し、再要約して取り込む運用にします。
+
 #### 単発取り込み（CLI）
 
 ```powershell
@@ -744,12 +758,12 @@ python scripts/pipeline.py
 
 #### 対応形式
 
-| 形式 | 想定ソース | 話者・タイムスタンプ |
+| 形式 | 想定ソース | pipeline での扱い |
 |---|---|---|
-| `.docx` | Microsoft Teams 会議トランスクリプト | 実名で抽出 |
-| `.vtt` | Zoom / Teams ライブキャプション | 抽出（`<v 名前>` タグから） |
-| `.txt` | iPhone ボイスメモ起こし、メモ全般 | 無し（プレーン本文） |
-| `.md` | Markdown メモ | 無し（プレーン本文） |
+| `.docx` | Microsoft Teams 会議トランスクリプト | Teams 形式に特化して話者・時刻を抽出。形式が合わない場合はプレーン本文として取り込む |
+| `.vtt` | Zoom / Teams ライブキャプション | タイムスタンプと `<v 名前>` タグから話者を抽出 |
+| `.txt` | iPhone ボイスメモ起こし、メモ全般 | プレーン本文として取り込む |
+| `.md` | Markdown メモ、既存要約 | プレーン本文として取り込み、再要約してから RAG に追加する |
 
 ### C. CLI で類似検索（動作確認）
 
@@ -935,10 +949,17 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
 
 | 操作 | 手元PCで | リモートPCで |
 |---|---|---|
-| マイク録音 | `python scripts/record_mic.py` | 自動で処理開始 |
-| Teams 議事録投入 | エクスプローラで `\\nas-server\share\PersonalRAG\input_text\` にドラッグ | 自動で処理開始 |
+| マイク録音 | `python scripts/record_mic.py` | 録音終了後、NAS の `input\` を監視して自動処理 |
+| 外部録音投入 | エクスプローラで `\\nas-server\share\PersonalRAG\input\` にコピー | 文字起こし → 要約 → ChromaDB 投入 |
+| 書き起こし / Markdown 投入 | `.vtt` / `.docx` / `.txt` / `.md` を `\\nas-server\share\PersonalRAG\input_text\` にコピー | 正規化 → 再要約 → ChromaDB 投入 |
 | 検索・チャット | ブラウザで `http://<REMOTE-IP>:3000` | （何もしない） |
 | ログ確認 | 必要時のみ RDP でリモートにログイン | RDP で `data/logs/pipeline.log` |
+
+この構成では、手元 PC は録音・ファイル投入だけを担当し、文字起こし・要約・RAG 追加は
+リモート PC 上の `pipeline.py` が実行します。`input\` / `input_text\` は NAS 共有、
+`transcripts_dir` / `notes_dir` / `chromadb_dir` はリモート PC のローカルディスクに置きます。
+Open WebUI Knowledge への自動同期まで使う場合は、リモート PC 側で `openwebui.enabled`、
+`openwebui.knowledge_id`、`OPENWEBUI_API_KEY` を設定してください。
 
 #### F-5. 動作確認チェックリスト
 
