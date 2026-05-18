@@ -35,6 +35,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from config_loader import PROJECT_ROOT, load_settings, resolve_path
+from desktop_bridge import publish_note_copy
 from notify import notify
 from retry_tracker import (
     increment_retry_count,
@@ -464,6 +465,25 @@ def find_latest_note(notes_dir: Path, transcript_stem: str) -> Path | None:
     return candidate if candidate.exists() else None
 
 
+def publish_note_for_desktop(
+    note_path: Path,
+    settings: dict[str, Any],
+    logger: logging.Logger,
+) -> Path | None:
+    """Copy a generated note to the desktop-facing summaries folder if configured."""
+    published_dir_value = settings.get("paths", {}).get("published_notes_dir")
+    if not published_dir_value:
+        return None
+    try:
+        published_dir = resolve_path(published_dir_value)
+        published_note = publish_note_copy(note_path, published_dir)
+        logger.info(f"要約を手元PC向けに公開: {published_note}")
+        return published_note
+    except Exception as exc:
+        logger.warning(f"要約の公開コピーに失敗（pipeline は継続）: {exc}")
+        return None
+
+
 def process_audio(
     audio_path: Path,
     settings: dict[str, Any],
@@ -728,6 +748,8 @@ def process_audio(
         _handle_step_failure("ingest_db 失敗")
         return
 
+    published_note = publish_note_for_desktop(note_path, settings, logger)
+
     # Step 5: Open WebUI Knowledge への自動同期（任意・失敗しても続行）
     # この同期は WebUI が起動していない場合でも pipeline を止めない設計にしている。
     # sync に失敗した分は後から「python scripts/sync_webui.py」で回収できる。
@@ -778,6 +800,7 @@ def process_audio(
             "result": "success",
             "finished_at": _now_iso(),
             "note_path": str(note_path),
+            "published_note": str(published_note) if published_note else "",
         })
         write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
 
@@ -1111,6 +1134,8 @@ def process_text(
         _handle_step_failure("ingest_db 失敗")
         return
 
+    published_note = publish_note_for_desktop(note_path, settings, logger)
+
     # Step 5: Open WebUI Knowledge への自動同期（任意・失敗しても続行）
     # 音声フローと同じ設計。WebUI が停止中でも pipeline は完走する。
     if settings.get("openwebui", {}).get("enabled", False):
@@ -1150,6 +1175,7 @@ def process_text(
             "result": "success",
             "finished_at": _now_iso(),
             "note_path": str(note_path),
+            "published_note": str(published_note) if published_note else "",
         })
         write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
 

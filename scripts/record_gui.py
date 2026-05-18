@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -52,7 +53,25 @@ from tkinter import filedialog, messagebox, ttk
 import sounddevice as sd
 
 from config_loader import load_settings, resolve_path, update_settings_path, PROJECT_ROOT
+from desktop_bridge import (
+    INPUT_AUDIO,
+    INPUT_TEXT,
+    classify_input_file,
+    copy_file_unique,
+    is_pipeline_state_fresh,
+)
+from note_viewer import extract_display_label, parse_frontmatter, search_text
 from recorder import Recorder
+from remote_services import (
+    ACTION_REFRESH,
+    ACTION_START,
+    ACTION_STOP,
+    SERVICE_ALL,
+    SERVICE_NAMES,
+    create_service_command,
+    get_control_dir,
+    read_service_status,
+)
 from service_manager import ServiceManager, ServiceInfo, ServiceStatus
 
 # GUI に依存しない純粋な関数は recording_meta.py に切り出してある。
@@ -91,6 +110,12 @@ try:
 except ImportError:  # pragma: no cover - 未インストール時はトーストをスキップ
     _WinotifyNotification = None  # type: ignore[assignment]
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:  # pragma: no cover - optional desktop nicety
+    DND_FILES = None  # type: ignore[assignment]
+    TkinterDnD = None  # type: ignore[assignment]
+
 
 class AppState(enum.Enum):
     """GUI の表示状態。録音実体の状態は Recorder.is_running() を正とし、
@@ -112,13 +137,30 @@ class RecordingApp:
     def __init__(self) -> None:
         # --- 設定読み込み ---
         settings = load_settings()
+        self._settings = settings
         rec_cfg = settings["recording"]
+        paths_cfg = settings["paths"]
+        pipeline_cfg = settings.get("pipeline", {})
+        ui_cfg = settings.get("ui", {})
         self.recordings_dir: Path = resolve_path(settings["paths"]["recordings_dir"])
         self._pipeline_input_dir: Path = resolve_path(settings["paths"]["input_dir"])
+        self._input_text_dir: Path = resolve_path(settings["paths"]["input_text_dir"])
+        self._published_notes_dir: Path = resolve_path(
+            paths_cfg.get("published_notes_dir", paths_cfg.get("notes_dir", "data/notes"))
+        )
+        self._audio_extensions = pipeline_cfg.get(
+            "watch_extensions", [".wav", ".mp3", ".m4a", ".flac", ".ogg"]
+        )
+        self._text_extensions = pipeline_cfg.get(
+            "text_extensions", [".txt", ".vtt", ".docx", ".md"]
+        )
+        self._pipeline_stale_seconds = int(ui_cfg.get("pipeline_stale_seconds", 30))
+        self._local_service_management = bool(ui_cfg.get("local_service_management", False))
+        self._remote_control_dir: Path = get_control_dir(settings)
         self.hotkey: str = rec_cfg.get("hotkey", "ctrl+alt+r")
 
         # --- パイプライン状態ファイルのパス（pipeline.py が書き出すファイルを読む） ---
-        state_file_rel = settings.get("pipeline", {}).get(
+        state_file_rel = paths_cfg.get("remote_pipeline_state_file") or pipeline_cfg.get(
             "state_file", "data/logs/pipeline_state.json"
         )
         self._pipeline_state_file: Path = resolve_path(state_file_rel)
@@ -127,7 +169,6 @@ class RecordingApp:
 
         # --- 失敗ファイル管理 ---
         # failed_files.json のパス（pipeline.py が書き出す）
-        pipeline_cfg = settings.get("pipeline", {})
         self._failed_files_log: Path = resolve_path(
             pipeline_cfg.get("failed_files_log", "data/logs/failed_files.json")
         )
@@ -179,12 +220,14 @@ class RecordingApp:
         self._service_status_lock = threading.Lock()
         # ポーリングスレッドの停止フラグ（Event.wait で割り込み可能な待機に使う）
         self._service_poll_stop = threading.Event()
-        # daemon=True で GUI 強制終了時にスレッドも自動終了する
-        self._service_poll_thread = threading.Thread(
-            target=self._poll_services, daemon=True, name="service-poll"
-        )
-        self._service_poll_thread.start()
-        self.service_manager.start_notes_auto_sync()
+        self._service_poll_thread: threading.Thread | None = None
+        if self._local_service_management:
+            # daemon=True で GUI 強制終了時にスレッドも自動終了する
+            self._service_poll_thread = threading.Thread(
+                target=self._poll_services, daemon=True, name="service-poll"
+            )
+            self._service_poll_thread.start()
+            self.service_manager.start_notes_auto_sync()
 
         # サービス管理カードのウィジェット参照（_build_window で設定する）
         # 各行: {"status_label": Label, "detail_label": Label, "button": Button}
@@ -209,12 +252,23 @@ class RecordingApp:
         self._gray_image: Any = self._make_icon_image("gray") if Image else None
         self._red_image: Any = self._make_icon_image("red") if Image else None
 
+        # --- 手元PCコンソール状態 ---
+        self._drop_history: list[dict[str, str]] = []
+        self._summary_paths: list[Path] = []
+        self._summary_filtered_paths: list[Path] = []
+        self._selected_summary_path: Path | None = None
+        self._summary_last_refresh: float = 0.0
+        self._nas_last_check: float = 0.0
+        self._remote_service_last_read: float = 0.0
+        self._remote_service_widgets: dict[str, dict[str, Any]] = {}
+        self._remote_service_message_var: tk.StringVar | None = None
+
         # --- GUI 構築 ---
-        self.root = tk.Tk()
-        self.root.title("PersonalRAG 録音")
-        # タブ追加に伴い高さを拡張
-        self.root.geometry("520x480")
-        self.root.resizable(False, False)
+        if TkinterDnD is not None:
+            self.root = TkinterDnD.Tk()
+        else:
+            self.root = tk.Tk()
+        self.root.title("PersonalRAG")
         self._build_window()
 
         # --- トレイ・ホットキー（任意機能。失敗しても録音はできる）---
@@ -241,95 +295,158 @@ class RecordingApp:
     # ------------------------------------------------------------------
 
     def _configure_styles(self) -> None:
-        """ttk の見た目をアプリ用に整える。
-
-        追加ライブラリを使わず、会社 PC でも動く範囲で余白・色・強調だけを整える。
-        """
+        """Apple 風ミニマルに寄せた ttk スタイルを設定する。"""
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
 
+        self._color_bg = "#F7F7F5"
+        self._color_surface = "#FFFFFF"
+        self._color_text = "#1D1D1F"
+        self._color_muted = "#6E6E73"
+        self._color_line = "#E5E5EA"
+        self._color_blue = "#007AFF"
+        self._color_green = "#34C759"
+        self._color_orange = "#FF9500"
+        self._color_red = "#FF3B30"
+
         base_font = ("Yu Gothic UI", 10)
-        title_font = ("Yu Gothic UI", 18, "bold")
-        section_font = ("Yu Gothic UI", 11, "bold")
-        status_font = ("Yu Gothic UI", 14, "bold")
+        title_font = ("Yu Gothic UI", 20, "bold")
+        section_font = ("Yu Gothic UI", 12, "bold")
+        status_font = ("Yu Gothic UI", 15, "bold")
         small_font = ("Yu Gothic UI", 9)
 
         style.configure(".", font=base_font)
-        style.configure("App.TFrame", background="#f6f7fb")
-        style.configure("Surface.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("Header.TLabel", background="#f6f7fb", foreground="#111827", font=title_font)
-        style.configure("Subtle.TLabel", background="#f6f7fb", foreground="#6b7280", font=small_font)
-        style.configure("Surface.TLabel", background="#ffffff", foreground="#111827")
-        style.configure("Section.TLabel", background="#ffffff", foreground="#111827", font=section_font)
-        style.configure("Status.TLabel", background="#ffffff", foreground="#111827", font=status_font)
-        style.configure("Hint.TLabel", background="#ffffff", foreground="#6b7280", font=small_font)
-        style.configure("DangerHint.TLabel", background="#ffffff", foreground="#b42318", font=small_font)
-        style.configure("Primary.TButton", font=("Yu Gothic UI", 12, "bold"), padding=(12, 10))
-        style.configure("Secondary.TButton", padding=(10, 6))
-        style.configure("ServiceCard.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("StepPending.TLabel", background="#eef0f4", foreground="#6b7280", padding=(8, 5))
-        style.configure("StepActive.TLabel", background="#dbeafe", foreground="#1d4ed8", padding=(8, 5))
-        style.configure("StepDone.TLabel", background="#dcfce7", foreground="#166534", padding=(8, 5))
-        style.configure("StepError.TLabel", background="#fee2e2", foreground="#b42318", padding=(8, 5))
-        style.configure("Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#2563eb")
+        style.configure("App.TFrame", background=self._color_bg)
+        style.configure(
+            "Surface.TFrame",
+            background=self._color_surface,
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure("Flat.TFrame", background=self._color_surface)
+        style.configure("Header.TLabel", background=self._color_bg, foreground=self._color_text, font=title_font)
+        style.configure("Subtle.TLabel", background=self._color_bg, foreground=self._color_muted, font=small_font)
+        style.configure("Surface.TLabel", background=self._color_surface, foreground=self._color_text)
+        style.configure("Muted.TLabel", background=self._color_surface, foreground=self._color_muted, font=small_font)
+        style.configure("Hint.TLabel", background=self._color_surface, foreground=self._color_muted, font=small_font)
+        style.configure("Section.TLabel", background=self._color_surface, foreground=self._color_text, font=section_font)
+        style.configure("Status.TLabel", background=self._color_surface, foreground=self._color_text, font=status_font)
+        style.configure("DangerHint.TLabel", background=self._color_surface, foreground=self._color_red, font=small_font)
+        style.configure("Primary.TButton", font=("Yu Gothic UI", 11, "bold"), padding=(16, 10))
+        style.configure("Secondary.TButton", padding=(12, 7))
+        style.configure("Ghost.TButton", padding=(10, 6))
+        style.configure("ServiceCard.TFrame", background=self._color_surface, relief="solid", borderwidth=1)
+        style.configure("StepPending.TLabel", background="#F2F2F7", foreground=self._color_muted, padding=(10, 6))
+        style.configure("StepActive.TLabel", background="#E5F1FF", foreground=self._color_blue, padding=(10, 6))
+        style.configure("StepDone.TLabel", background="#E8F8EE", foreground="#248A3D", padding=(10, 6))
+        style.configure("StepError.TLabel", background="#FFE9E6", foreground=self._color_red, padding=(10, 6))
+        style.configure("Horizontal.TProgressbar", troughcolor="#E5E5EA", background=self._color_blue)
+        style.configure("TNotebook", background=self._color_bg, borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(18, 9), background="#ECECEA", foreground=self._color_muted)
+        style.map("TNotebook.Tab", background=[("selected", self._color_surface)], foreground=[("selected", self._color_text)])
+        style.configure("Treeview", rowheight=28, borderwidth=0)
 
     def _build_window(self) -> None:
-        """tkinter のウィジェット配置。
-
-        録音、パイプライン、サービス状態を 1 画面にまとめる。
-        詳細一覧や隔離ファイル操作は既存のダイアログをそのまま使う。
-        """
+        """手元PC向けコンソールのウィジェットを配置する。"""
         self._configure_styles()
-        self.root.geometry("760x660")
-        self.root.minsize(700, 600)
+        self.root.geometry("1080x760")
+        self.root.minsize(920, 660)
         self.root.resizable(True, True)
 
-        root_frame = ttk.Frame(self.root, style="App.TFrame", padding=16)
+        root_frame = ttk.Frame(self.root, style="App.TFrame", padding=18)
         root_frame.pack(fill="both", expand=True)
         root_frame.columnconfigure(0, weight=1)
-        root_frame.columnconfigure(1, weight=1)
         root_frame.rowconfigure(2, weight=1)
 
         header = ttk.Frame(root_frame, style="App.TFrame")
-        header.grid(row=0, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        header.grid(row=0, column=0, sticky="we", pady=(0, 14))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="PersonalRAG", style="Header.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
             header,
-            text=f"完全ローカル録音・要約・検索  /  ホットキー: {self.hotkey.upper()}",
+            text=f"録音、投入、要約参照、処理状況をこの画面で管理  /  ホットキー: {self.hotkey.upper()}",
             style="Subtle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            header,
+            text="更新",
+            command=self._manual_refresh_console,
+            style="Ghost.TButton",
+        ).grid(row=0, column=1, rowspan=2, sticky="e")
 
-        recording_panel = ttk.Frame(root_frame, style="Surface.TFrame", padding=14)
-        recording_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
+        status_bar = ttk.Frame(root_frame, style="App.TFrame")
+        status_bar.grid(row=1, column=0, sticky="we", pady=(0, 14))
+        for col in range(3):
+            status_bar.columnconfigure(col, weight=1, uniform="status")
+        self._recording_status_card_var = tk.StringVar(value="待機中")
+        self._nas_status_card_var = tk.StringVar(value="確認中")
+        self._pipeline_status_card_var = tk.StringVar(value="確認中")
+        self._build_status_card(status_bar, 0, "録音", self._recording_status_card_var)
+        self._build_status_card(status_bar, 1, "NAS", self._nas_status_card_var)
+        self._build_status_card(status_bar, 2, "Pipeline", self._pipeline_status_card_var)
+
+        self._main_notebook = ttk.Notebook(root_frame)
+        self._main_notebook.grid(row=2, column=0, sticky="nsew")
+
+        recording_panel = ttk.Frame(self._main_notebook, style="Surface.TFrame", padding=18)
+        drop_panel = ttk.Frame(self._main_notebook, style="Surface.TFrame", padding=18)
+        pipeline_panel = ttk.Frame(self._main_notebook, style="Surface.TFrame", padding=18)
+        summary_panel = ttk.Frame(self._main_notebook, style="Surface.TFrame", padding=18)
+        service_panel = ttk.Frame(self._main_notebook, style="Surface.TFrame", padding=18)
+
+        self._main_notebook.add(recording_panel, text="録音")
+        self._main_notebook.add(drop_panel, text="ファイル投入")
+        self._main_notebook.add(pipeline_panel, text="処理状況")
+        self._main_notebook.add(summary_panel, text="要約")
+        self._main_notebook.add(service_panel, text="サービス")
+        self._summary_tab_index = 3
+
         self._build_recording_tab(recording_panel)
-
-        service_panel = ttk.Frame(root_frame, style="Surface.TFrame", padding=14)
-        service_panel.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 12))
-        self._build_service_tab(service_panel)
-
-        pipeline_panel = ttk.Frame(root_frame, style="Surface.TFrame", padding=14)
-        pipeline_panel.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        self._build_drop_tab(drop_panel)
         self._build_pipeline_panel(pipeline_panel)
+        self._build_summary_tab(summary_panel)
+        if self._local_service_management:
+            self._build_service_tab(service_panel)
+        else:
+            self._build_remote_service_tab(service_panel)
 
         # ×ボタンの挙動: 完全終了せずトレイへ収納（トレイが無ければ確認の上で完全終了）
         self.root.protocol("WM_DELETE_WINDOW", self._on_minimize_to_tray)
 
+        self._manual_refresh_console()
+
+    def _build_status_card(
+        self,
+        parent: ttk.Frame,
+        column: int,
+        title: str,
+        value_var: tk.StringVar,
+    ) -> None:
+        """上部ステータスバーの小さなカードを作る。"""
+        card = ttk.Frame(parent, style="Surface.TFrame", padding=(14, 10))
+        card.grid(row=0, column=column, sticky="we", padx=(0 if column == 0 else 10, 0))
+        card.columnconfigure(0, weight=1)
+        ttk.Label(card, text=title, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, textvariable=value_var, style="Status.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(3, 0)
+        )
+
     def _build_recording_tab(self, frame: ttk.Frame) -> None:
         """録音コックピットを配置する。"""
         frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
         ttk.Label(frame, text="録音", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w"
+            row=0, column=0, columnspan=2, sticky="w"
         )
 
         self.status_var = tk.StringVar(value="待機中")
         self.status_label = ttk.Label(frame, textvariable=self.status_var, style="Status.TLabel")
-        self.status_label.grid(row=1, column=0, sticky="w", pady=(8, 10))
+        self.status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 12))
 
         self.toggle_button = ttk.Button(
             frame,
@@ -337,32 +454,38 @@ class RecordingApp:
             command=lambda: self.command_queue.put(COMMAND_TOGGLE),
             style="Primary.TButton",
         )
-        self.toggle_button.grid(row=2, column=0, sticky="we", pady=(0, 12))
+        self.toggle_button.grid(row=2, column=0, sticky="we", pady=(0, 16), padx=(0, 8))
+        ttk.Button(
+            frame,
+            text="要約を見る",
+            command=self._select_summary_tab,
+            style="Secondary.TButton",
+        ).grid(row=2, column=1, sticky="we", pady=(0, 16), padx=(8, 0))
 
         # マイクデバイス選択
         ttk.Label(frame, text="マイクデバイス", style="Surface.TLabel").grid(
-            row=3, column=0, sticky="w"
+            row=3, column=0, columnspan=2, sticky="w"
         )
         self.device_var = tk.StringVar()
         self.device_combobox = ttk.Combobox(
             frame, textvariable=self.device_var, state="readonly"
         )
-        self.device_combobox.grid(row=4, column=0, sticky="we", pady=(4, 12))
+        self.device_combobox.grid(row=4, column=0, columnspan=2, sticky="we", pady=(4, 14))
         self._refresh_devices()
 
         ttk.Label(frame, text="保存先", style="Surface.TLabel").grid(
-            row=5, column=0, sticky="w"
+            row=5, column=0, columnspan=2, sticky="w"
         )
         self.path_var = tk.StringVar(value=str(self.recordings_dir))
         ttk.Label(
             frame,
             textvariable=self.path_var,
-            style="Hint.TLabel",
-            wraplength=320,
-        ).grid(row=6, column=0, sticky="w", pady=(4, 8))
+            style="Muted.TLabel",
+            wraplength=820,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 10))
 
-        button_row = ttk.Frame(frame, style="Surface.TFrame")
-        button_row.grid(row=7, column=0, sticky="we")
+        button_row = ttk.Frame(frame, style="Flat.TFrame")
+        button_row.grid(row=7, column=0, columnspan=2, sticky="we")
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
         ttk.Button(
@@ -373,14 +496,167 @@ class RecordingApp:
         ).grid(row=0, column=0, sticky="we", padx=(0, 6))
         ttk.Button(
             button_row,
-            text="ノートを開く",
-            command=self._open_note_viewer,
+            text="保存先を開く",
+            command=lambda: self._open_directory(self.recordings_dir),
             style="Secondary.TButton",
         ).grid(row=0, column=1, sticky="we", padx=(6, 0))
+
+    def _build_drop_tab(self, frame: ttk.Frame) -> None:
+        """ファイル投入ビューを作る。"""
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+        ttk.Label(frame, text="ファイル投入", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+
+        drop_frame = tk.Frame(
+            frame,
+            background="#FFFFFF",
+            highlightbackground="#D1D1D6",
+            highlightthickness=1,
+            bd=0,
+        )
+        drop_frame.grid(row=1, column=0, sticky="we", pady=(12, 14), ipady=32)
+        drop_frame.columnconfigure(0, weight=1)
+        self._drop_zone_label = tk.Label(
+            drop_frame,
+            text="ここにファイルをドラッグ＆ドロップ",
+            background="#FFFFFF",
+            foreground=self._color_text,
+            font=("Yu Gothic UI", 15, "bold"),
+        )
+        self._drop_zone_label.grid(row=0, column=0, sticky="we")
+        tk.Label(
+            drop_frame,
+            text="音声は input、VTT/DOCX/TXT/MD は input_text に自動振り分け",
+            background="#FFFFFF",
+            foreground=self._color_muted,
+            font=("Yu Gothic UI", 9),
+        ).grid(row=1, column=0, sticky="we", pady=(6, 0))
+
+        if DND_FILES is not None and hasattr(drop_frame, "drop_target_register"):
+            drop_frame.drop_target_register(DND_FILES)
+            drop_frame.dnd_bind("<<Drop>>", self._on_drop_files)
+            if hasattr(self._drop_zone_label, "drop_target_register"):
+                self._drop_zone_label.drop_target_register(DND_FILES)
+                self._drop_zone_label.dnd_bind("<<Drop>>", self._on_drop_files)
+        else:
+            self._drop_zone_label.config(text="ドラッグ＆ドロップは未有効です")
+
+        action_row = ttk.Frame(frame, style="Flat.TFrame")
+        action_row.grid(row=2, column=0, sticky="we", pady=(0, 12))
+        ttk.Button(
+            action_row,
+            text="ファイルを選ぶ",
+            command=self._choose_input_files,
+            style="Primary.TButton",
+        ).pack(side="left")
+        ttk.Button(
+            action_row,
+            text="投入先を開く",
+            command=self._open_input_dirs,
+            style="Secondary.TButton",
+        ).pack(side="left", padx=(10, 0))
+
+        columns = ("時刻", "ファイル", "投入先", "結果")
+        self._drop_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
+        for col, width in zip(columns, [90, 360, 170, 260]):
+            self._drop_tree.heading(col, text=col)
+            self._drop_tree.column(col, width=width, anchor="w")
+        self._drop_tree.grid(row=3, column=0, sticky="nsew")
+
+    def _build_summary_tab(self, frame: ttk.Frame) -> None:
+        """公開済み要約の一覧・検索・プレビューを作る。"""
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=2)
+        frame.rowconfigure(2, weight=1)
+
+        ttk.Label(frame, text="要約", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self._summary_count_var = tk.StringVar(value="0 件")
+        ttk.Label(frame, textvariable=self._summary_count_var, style="Muted.TLabel").grid(
+            row=0, column=1, sticky="e"
+        )
+
+        search_row = ttk.Frame(frame, style="Flat.TFrame")
+        search_row.grid(row=1, column=0, columnspan=2, sticky="we", pady=(12, 10))
+        search_row.columnconfigure(0, weight=1)
+        self._summary_search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_row, textvariable=self._summary_search_var)
+        search_entry.grid(row=0, column=0, sticky="we")
+        search_entry.bind("<Return>", lambda _event: self._filter_summaries())
+        ttk.Button(
+            search_row,
+            text="検索",
+            command=self._filter_summaries,
+            style="Secondary.TButton",
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(
+            search_row,
+            text="更新",
+            command=self._load_published_summaries,
+            style="Secondary.TButton",
+        ).grid(row=0, column=2, padx=(8, 0))
+
+        list_frame = ttk.Frame(frame, style="Flat.TFrame")
+        list_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        self._summary_listbox = tk.Listbox(
+            list_frame,
+            selectmode="single",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground="#D1D1D6",
+            font=("Yu Gothic UI", 10),
+        )
+        self._summary_listbox.grid(row=0, column=0, sticky="nsew")
+        self._summary_listbox.bind("<<ListboxSelect>>", self._on_summary_select)
+        summary_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._summary_listbox.yview)
+        summary_scroll.grid(row=0, column=1, sticky="ns")
+        self._summary_listbox.configure(yscrollcommand=summary_scroll.set)
+
+        preview_frame = ttk.Frame(frame, style="Flat.TFrame")
+        preview_frame.grid(row=2, column=1, sticky="nsew")
+        preview_frame.rowconfigure(1, weight=1)
+        preview_frame.columnconfigure(0, weight=1)
+        self._summary_meta_var = tk.StringVar(value="要約を選択してください")
+        ttk.Label(preview_frame, textvariable=self._summary_meta_var, style="Muted.TLabel").grid(
+            row=0, column=0, sticky="we", pady=(0, 8)
+        )
+        self._summary_text = tk.Text(
+            preview_frame,
+            wrap="word",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground="#D1D1D6",
+            background="#FFFFFF",
+            foreground="#1D1D1F",
+            font=("Yu Gothic UI", 10),
+            padx=12,
+            pady=10,
+            state="disabled",
+        )
+        self._summary_text.grid(row=1, column=0, sticky="nsew")
+        preview_actions = ttk.Frame(preview_frame, style="Flat.TFrame")
+        preview_actions.grid(row=2, column=0, sticky="we", pady=(10, 0))
+        ttk.Button(
+            preview_actions,
+            text="開く",
+            command=self._open_selected_summary,
+            style="Secondary.TButton",
+        ).pack(side="left")
+        ttk.Button(
+            preview_actions,
+            text="フォルダ",
+            command=lambda: self._open_directory(self._published_notes_dir),
+            style="Secondary.TButton",
+        ).pack(side="left", padx=(8, 0))
 
     def _build_pipeline_panel(self, frame: ttk.Frame) -> None:
         """パイプラインの処理進捗を見える化する。"""
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(6, weight=1)
         ttk.Label(frame, text="パイプライン進捗", style="Section.TLabel").grid(
             row=0, column=0, sticky="w"
         )
@@ -428,12 +704,12 @@ class RecordingApp:
         ttk.Label(
             frame,
             textvariable=self._pipeline_events_var,
-            style="Hint.TLabel",
+            style="Muted.TLabel",
             justify="left",
             wraplength=700,
-        ).grid(row=5, column=0, sticky="we", pady=(6, 0))
+        ).grid(row=5, column=0, sticky="we", pady=(8, 0))
 
-        action_row = ttk.Frame(frame, style="Surface.TFrame")
+        action_row = ttk.Frame(frame, style="Flat.TFrame")
         action_row.grid(row=6, column=0, sticky="w", pady=(12, 0))
         ttk.Button(
             action_row,
@@ -452,9 +728,348 @@ class RecordingApp:
 
         ttk.Label(
             frame,
-            text="（連続失敗が 3 回に達したファイルが「隔離ファイル」として一覧表示されます）",
-            style="Hint.TLabel",
+            text="状態はリモートPCがNASへ書き出した pipeline_state.json の鮮度で判定します。",
+            style="Muted.TLabel",
         ).grid(row=7, column=0, sticky="w", pady=(6, 0))
+
+    def _manual_refresh_console(self) -> None:
+        """画面上のNAS/状態/要約を手動更新する。"""
+        self._update_pipeline_status()
+        self._update_nas_status()
+        self._load_published_summaries()
+
+    def _select_summary_tab(self) -> None:
+        """要約タブを選択する。"""
+        notebook = getattr(self, "_main_notebook", None)
+        if notebook is not None:
+            notebook.select(self._summary_tab_index)
+            self._load_published_summaries()
+
+    def _open_directory(self, path: Path) -> None:
+        """Windows Explorer でディレクトリを開く。"""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))
+        except Exception as exc:
+            messagebox.showerror("フォルダを開けません", f"{path}\n\n{exc}")
+
+    def _update_nas_status(self) -> None:
+        """投入先・状態・要約公開先へのアクセス可否を上部カードへ反映する。"""
+        checks = [
+            self.recordings_dir,
+            self._input_text_dir,
+            self._pipeline_state_file.parent,
+            self._published_notes_dir,
+        ]
+        try:
+            missing = [path for path in checks if not path.exists()]
+            if missing:
+                self._nas_status_card_var.set("未接続/未作成")
+            else:
+                self._nas_status_card_var.set("接続中")
+        except Exception:
+            self._nas_status_card_var.set("通信なし")
+
+    def _on_drop_files(self, event: Any) -> None:
+        """DnDで受け取ったファイル群を投入先へコピーする。"""
+        try:
+            paths = [Path(value) for value in self.root.tk.splitlist(event.data)]
+        except Exception:
+            paths = [Path(str(event.data))]
+        self._ingest_input_files(paths)
+
+    def _choose_input_files(self) -> None:
+        """DnD不可環境向けのファイル選択投入。"""
+        chosen = filedialog.askopenfilenames(title="投入するファイルを選択")
+        if not chosen:
+            return
+        self._ingest_input_files([Path(value) for value in chosen])
+
+    def _ingest_input_files(self, paths: list[Path]) -> None:
+        """拡張子に応じて input / input_text へコピーする。"""
+        for source in paths:
+            if not source.exists() or not source.is_file():
+                self._add_drop_history(source, "-", "ファイルが見つかりません")
+                continue
+            kind = classify_input_file(source, self._audio_extensions, self._text_extensions)
+            if kind == INPUT_AUDIO:
+                dest_dir = self._pipeline_input_dir
+                label = "input"
+            elif kind == INPUT_TEXT:
+                dest_dir = self._input_text_dir
+                label = "input_text"
+            else:
+                self._add_drop_history(source, "-", "未対応の拡張子")
+                continue
+            try:
+                dest = copy_file_unique(source, dest_dir)
+                self._add_drop_history(source, label, f"投入完了: {dest.name}")
+            except Exception as exc:
+                self._add_drop_history(source, label, f"投入失敗: {exc}")
+        self._update_nas_status()
+
+    def _add_drop_history(self, source: Path, dest_label: str, result: str) -> None:
+        """投入履歴を最大50件保持してTreeviewへ反映する。"""
+        self._drop_history.append(
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "file": source.name,
+                "dest": dest_label,
+                "result": result,
+            }
+        )
+        self._drop_history = self._drop_history[-50:]
+        tree = getattr(self, "_drop_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        for entry in reversed(self._drop_history):
+            tree.insert("", "end", values=(entry["time"], entry["file"], entry["dest"], entry["result"]))
+
+    def _open_input_dirs(self) -> None:
+        """投入先の親フォルダを開く。"""
+        target = self._pipeline_input_dir.parent
+        self._open_directory(target)
+
+    def _load_published_summaries(self) -> None:
+        """公開要約フォルダから .md 一覧を読み込む。"""
+        try:
+            if not self._published_notes_dir.exists():
+                self._summary_paths = []
+            else:
+                self._summary_paths = sorted(
+                    self._published_notes_dir.glob("*.md"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+        except Exception:
+            self._summary_paths = []
+        self._filter_summaries()
+
+    def _filter_summaries(self) -> None:
+        """要約一覧をテキスト検索で絞り込む。"""
+        query = self._summary_search_var.get().strip() if hasattr(self, "_summary_search_var") else ""
+        if query:
+            self._summary_filtered_paths = search_text(query, self._summary_paths)
+        else:
+            self._summary_filtered_paths = list(self._summary_paths)
+
+        listbox = getattr(self, "_summary_listbox", None)
+        if listbox is None:
+            return
+        listbox.delete(0, tk.END)
+        for path in self._summary_filtered_paths:
+            try:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime)
+                label, _meta = extract_display_label(path, mtime)
+            except Exception:
+                label = path.name
+            listbox.insert(tk.END, label)
+        self._summary_count_var.set(f"{len(self._summary_filtered_paths)} 件")
+        if self._summary_filtered_paths:
+            listbox.selection_set(0)
+            self._show_summary(self._summary_filtered_paths[0])
+        else:
+            self._selected_summary_path = None
+            self._summary_meta_var.set("要約がありません")
+            self._set_summary_text("")
+
+    def _on_summary_select(self, _event: Any) -> None:
+        """要約一覧選択時にプレビューを更新する。"""
+        selection = self._summary_listbox.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index >= len(self._summary_filtered_paths):
+            return
+        self._show_summary(self._summary_filtered_paths[index])
+
+    def _show_summary(self, path: Path) -> None:
+        """要約ファイルを右ペインに表示する。"""
+        self._selected_summary_path = path
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            meta, body = parse_frontmatter(text)
+            title = str(meta.get("title") or path.stem)
+            participants = str(meta.get("participants") or "")
+            recorded_at = str(meta.get("recorded_at") or meta.get("date") or "")
+            bits = [title]
+            if participants:
+                bits.append(participants)
+            if recorded_at:
+                bits.append(recorded_at)
+            self._summary_meta_var.set("  /  ".join(bits))
+            self._set_summary_text(body)
+        except Exception as exc:
+            self._summary_meta_var.set(path.name)
+            self._set_summary_text(f"読み込みに失敗しました:\n{exc}")
+
+    def _set_summary_text(self, text: str) -> None:
+        """要約プレビューのTextを安全に更新する。"""
+        widget = getattr(self, "_summary_text", None)
+        if widget is None:
+            return
+        widget.config(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        widget.config(state="disabled")
+
+    def _open_selected_summary(self) -> None:
+        """選択中の要約を既定アプリで開く。"""
+        if self._selected_summary_path is None:
+            return
+        try:
+            os.startfile(str(self._selected_summary_path))
+        except Exception as exc:
+            messagebox.showerror("要約を開けません", f"{self._selected_summary_path}\n\n{exc}")
+
+    def _build_remote_service_tab(self, frame: ttk.Frame) -> None:
+        """NAS 経由のリモートサービス制御ビューを作る。"""
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text="リモートサービス", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self._remote_service_message_var = tk.StringVar(
+            value="リモートPCで remote_service_agent.py を起動すると、状態表示とON/OFF操作が使えます。"
+        )
+        ttk.Label(
+            frame,
+            textvariable=self._remote_service_message_var,
+            style="Muted.TLabel",
+            wraplength=880,
+        ).grid(row=1, column=0, sticky="we", pady=(8, 14))
+
+        action_row = ttk.Frame(frame, style="Flat.TFrame")
+        action_row.grid(row=2, column=0, sticky="we", pady=(0, 12))
+        ttk.Button(
+            action_row,
+            text="すべてON",
+            command=lambda: self._send_remote_service_command(ACTION_START, SERVICE_ALL),
+            style="Primary.TButton",
+        ).pack(side="left")
+        ttk.Button(
+            action_row,
+            text="すべてOFF",
+            command=lambda: self._send_remote_service_command(ACTION_STOP, SERVICE_ALL),
+            style="Secondary.TButton",
+        ).pack(side="left", padx=(10, 0))
+        ttk.Button(
+            action_row,
+            text="更新",
+            command=lambda: self._send_remote_service_command(ACTION_REFRESH, SERVICE_ALL),
+            style="Secondary.TButton",
+        ).pack(side="left", padx=(10, 0))
+
+        for row, name in enumerate(SERVICE_NAMES, start=3):
+            card = ttk.Frame(frame, style="ServiceCard.TFrame", padding=12)
+            card.grid(row=row, column=0, sticky="we", pady=(0, 10))
+            card.columnconfigure(1, weight=1)
+            ttk.Label(
+                card,
+                text=name,
+                style="Surface.TLabel",
+                font=("Yu Gothic UI", 11, "bold"),
+            ).grid(row=0, column=0, sticky="w")
+            status_var = tk.StringVar(value="未接続")
+            detail_var = tk.StringVar(value="状態ファイル待ち")
+            ttk.Label(card, textvariable=status_var, style="Status.TLabel").grid(
+                row=0, column=1, sticky="e"
+            )
+            ttk.Label(card, textvariable=detail_var, style="Muted.TLabel", wraplength=560).grid(
+                row=1, column=0, columnspan=2, sticky="we", pady=(4, 10)
+            )
+            btn_row = ttk.Frame(card, style="Flat.TFrame")
+            btn_row.grid(row=2, column=0, columnspan=2, sticky="w")
+            ttk.Button(
+                btn_row,
+                text="ON",
+                command=lambda n=name: self._send_remote_service_command(ACTION_START, n),
+                style="Secondary.TButton",
+            ).pack(side="left")
+            ttk.Button(
+                btn_row,
+                text="OFF",
+                command=lambda n=name: self._send_remote_service_command(ACTION_STOP, n),
+                style="Secondary.TButton",
+            ).pack(side="left", padx=(8, 0))
+            self._remote_service_widgets[name] = {
+                "status_var": status_var,
+                "detail_var": detail_var,
+            }
+
+    def _send_remote_service_command(self, action: str, service: str) -> None:
+        """NASへリモートサービス操作コマンドを書き込む。"""
+        try:
+            command_path = create_service_command(
+                self._remote_control_dir,
+                action=action,
+                service=service,
+            )
+            label = {"start": "ON", "stop": "OFF", "refresh": "更新"}.get(action, action)
+            if self._remote_service_message_var is not None:
+                self._remote_service_message_var.set(
+                    f"{service} の {label} 要求を送信しました: {command_path.name}"
+                )
+        except Exception as exc:
+            messagebox.showerror("サービス操作に失敗", f"コマンドを書き込めませんでした:\n{exc}")
+        self._update_remote_services_status()
+
+    def _update_remote_services_status(self) -> None:
+        """remote_service_agent.py が公開したサービス状態を表示する。"""
+        if self._local_service_management:
+            return
+        try:
+            payload = read_service_status(self._remote_control_dir)
+            if payload is None:
+                self._set_remote_services_disconnected("状態ファイルなし")
+                return
+            if not is_pipeline_state_fresh(
+                payload,
+                stale_seconds=self._pipeline_stale_seconds,
+            ):
+                self._set_remote_services_disconnected("remote_service_agent 停止/通信なし")
+                return
+
+            services = {
+                str(service.get("name")): service
+                for service in payload.get("services", [])
+                if isinstance(service, dict)
+            }
+            for name in SERVICE_NAMES:
+                service = services.get(name, {})
+                status = str(service.get("status", "unknown"))
+                detail = str(service.get("detail", ""))
+                widgets = self._remote_service_widgets.get(name)
+                if widgets is None:
+                    continue
+                widgets["status_var"].set(self._format_remote_service_status(status))
+                widgets["detail_var"].set(detail or "詳細なし")
+
+            last_command = payload.get("last_command") or {}
+            if self._remote_service_message_var is not None and last_command:
+                ok = "成功" if last_command.get("ok") else "失敗"
+                self._remote_service_message_var.set(
+                    f"最終操作: {last_command.get('service')} {last_command.get('action')} / {ok} / {last_command.get('message', '')}"
+                )
+        except Exception as exc:
+            self._set_remote_services_disconnected(f"読み込み失敗: {exc}")
+
+    def _format_remote_service_status(self, status: str) -> str:
+        """サービス状態をUI向け短文に変換する。"""
+        if status == "running":
+            return "ON"
+        if status == "stopped":
+            return "OFF"
+        return "確認中"
+
+    def _set_remote_services_disconnected(self, message: str) -> None:
+        """サービス状態ファイルが読めないときの表示。"""
+        for widgets in self._remote_service_widgets.values():
+            widgets["status_var"].set("未接続")
+            widgets["detail_var"].set(message)
+        if self._remote_service_message_var is not None:
+            self._remote_service_message_var.set(message)
 
     def _build_service_tab(self, frame: ttk.Frame) -> None:
         """サービス管理カードを配置する。
@@ -701,12 +1316,24 @@ class RecordingApp:
                 self.status_label.config(foreground="black")
                 if self.tray_icon is not None:
                     self.tray_icon.title = f"PersonalRAG 録音中 {elapsed_str}"
+        self._recording_status_card_var.set(
+            "録音中" if self.state == AppState.RECORDING else "待機中"
+        )
 
         # 4) パイプライン状態ファイルを読んで GUI を更新（最終読み込みから 1 秒以上経った時のみ）
         now = time.monotonic()
         if now - self._pipeline_state_last_read >= 1.0:
             self._pipeline_state_last_read = now
             self._update_pipeline_status()
+        if now - self._nas_last_check >= 5.0:
+            self._nas_last_check = now
+            self._update_nas_status()
+        if now - self._summary_last_refresh >= 10.0:
+            self._summary_last_refresh = now
+            self._load_published_summaries()
+        if now - self._remote_service_last_read >= 3.0:
+            self._remote_service_last_read = now
+            self._update_remote_services_status()
 
         # 4-b) 隔離ファイルの件数を 5 秒おきに更新してボタンラベルに反映する
         if now - self._failed_count_last_read >= 5.0:
@@ -715,10 +1342,11 @@ class RecordingApp:
 
         # 5) サービス管理カードの表示更新（ロック取得 → キャッシュ参照 → 即解放）
         #    I/O なし・ロック保持時間は数マイクロ秒なので freeze の心配なし
-        with self._service_status_lock:
-            cache_snapshot = dict(self._service_status_cache)
-        if cache_snapshot:
-            self._update_service_tab(cache_snapshot)
+        if self._local_service_management:
+            with self._service_status_lock:
+                cache_snapshot = dict(self._service_status_cache)
+            if cache_snapshot:
+                self._update_service_tab(cache_snapshot)
 
         # 6) 次回呼び出しを予約
         self.root.after(100, self._tick)
@@ -998,17 +1626,12 @@ class RecordingApp:
     # ------------------------------------------------------------------
 
     def _update_pipeline_status(self) -> None:
-        """pipeline_state.json と lock PID を読んでパイプライン状態 UI を更新する。
-
-        状態ファイルの updated_at だけでは、古い heartbeat や壊れた lock と
-        組み合わさったときに「稼働中」と誤表示する可能性がある。
-        そのため、稼働判定は ServiceManager.check_pipeline() に集約する。
-        """
+        """NAS上の pipeline_state.json を読んで処理状況 UI を更新する。"""
         try:
             if not self._pipeline_state_file.exists():
-                # ファイルがない → Pipeline 未起動
-                self._pipeline_current_var.set("Pipeline 停止中（状態ファイルなし）")
-                self._pipeline_current_label.config(foreground="#cc0000")
+                self._pipeline_status_card_var.set("通信なし")
+                self._pipeline_current_var.set("状態ファイルなし")
+                self._pipeline_current_label.config(foreground=self._color_red)
                 self._pipeline_recent_var.set("最近の処理: —")
                 self._pipeline_events_var.set("最近のイベント: —")
                 self._set_pipeline_progress(False)
@@ -1019,14 +1642,16 @@ class RecordingApp:
             data = json.loads(text)
             recent = data.get("recent", [])
 
-            pipeline_info = self.service_manager.check_pipeline()
-            if pipeline_info.status != ServiceStatus.RUNNING:
-                # 停止中の表示（赤系で目立たせる）
-                self._pipeline_current_var.set(f"Pipeline {pipeline_info.detail}")
-                self._pipeline_current_label.config(foreground="#cc0000")
+            if not is_pipeline_state_fresh(
+                data,
+                stale_seconds=self._pipeline_stale_seconds,
+            ):
+                self._pipeline_status_card_var.set("通信なし")
+                updated_at = str(data.get("updated_at", ""))[:19].replace("T", " ")
+                self._pipeline_current_var.set(f"更新停止中  /  最終更新 {updated_at or '不明'}")
+                self._pipeline_current_label.config(foreground=self._color_orange)
                 self._set_pipeline_progress(False)
                 self._set_pipeline_steps(active_step=None, error=True)
-                # 停止中でも recent は読めるなら表示する
                 if recent:
                     self._update_pipeline_recent_count(recent)
                 else:
@@ -1034,8 +1659,8 @@ class RecordingApp:
                 self._update_pipeline_events(recent)
                 return
 
-            # --- Pipeline 稼働中 ---
-            self._pipeline_current_label.config(foreground="#333")
+            self._pipeline_status_card_var.set("稼働中")
+            self._pipeline_current_label.config(foreground=self._color_text)
 
             # 現在処理中のファイルを表示
             current = data.get("current")
@@ -1055,7 +1680,7 @@ class RecordingApp:
                 self._set_pipeline_steps(active_step=current.get("step"))
             else:
                 queue_len = len(data.get("queue", []))
-                self._pipeline_current_var.set(f"待機中（Pipeline 稼働中） / 待ち {queue_len} 件")
+                self._pipeline_current_var.set(f"待機中  /  待ち {queue_len} 件")
                 self._set_pipeline_progress(False)
                 latest_result = recent[-1].get("result") if recent else None
                 if latest_result == "success":
@@ -1071,8 +1696,9 @@ class RecordingApp:
 
         except Exception:
             # ファイル読み込み失敗・JSON 壊れ等は全て無視してフォールバック
-            self._pipeline_current_var.set("Pipeline 停止中（状態ファイル読み込み失敗）")
-            self._pipeline_current_label.config(foreground="#cc0000")
+            self._pipeline_status_card_var.set("読み込み失敗")
+            self._pipeline_current_var.set("状態ファイル読み込み失敗")
+            self._pipeline_current_label.config(foreground=self._color_red)
             self._pipeline_recent_var.set("最近の処理: — （読み込み失敗）")
             self._pipeline_events_var.set("最近のイベント: 状態ファイルを読み込めませんでした")
             self._set_pipeline_progress(False)
@@ -1149,7 +1775,7 @@ class RecordingApp:
                 time_text = "--:--"
 
             result_text = "完了" if entry.get("result") == "success" else "失敗"
-            detail = entry.get("error") or entry.get("note_path") or ""
+            detail = entry.get("error") or entry.get("published_note") or entry.get("note_path") or ""
             if detail:
                 detail = f"  /  {Path(str(detail)).name}"
             lines.append(f"{time_text}  {result_text}: {entry.get('file', '')}{detail}")
@@ -2110,7 +2736,7 @@ class RecordingApp:
             filename = entry.get("file", "?")
             finished_at = entry.get("finished_at", "")[:19].replace("T", " ")
             if result == "success":
-                note = entry.get("note_path", "")
+                note = entry.get("published_note") or entry.get("note_path", "")
                 note_basename = Path(note).name if note else ""
                 iid = tree.insert("", "end", values=("✓", filename, finished_at, note_basename))
                 if note:

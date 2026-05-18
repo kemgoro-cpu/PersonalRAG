@@ -27,6 +27,7 @@ PersonalRAG/
 │   ├── recordings/         # 旧録音保存先（現在の既定は data/input）
 │   ├── transcripts/        # 文字起こし結果 (.txt)
 │   ├── notes/              # 要約・ToDo (.md)
+│   ├── summaries/          # 手元PC向けに公開した要約コピー (.md)
 │   ├── chromadb/           # ベクター DB の永続化
 │   └── logs/               # pipeline.log
 ├── scripts/
@@ -34,12 +35,16 @@ PersonalRAG/
 │   ├── transcribe.py       # Step 1: 音声 → 文字起こし
 │   ├── import_transcript.py # Step 1-alt: テキスト取り込み（Teams/.vtt/.txt/.md）
 │   ├── record_mic.py       # Step 1 補助: マイク録音
+│   ├── record_gui.py       # 手元PC向け: 録音・投入・処理状況・要約参照 UI
 │   ├── summarize.py        # Step 2: テキスト → 要約・ToDo
 │   ├── ingest_db.py        # Step 3: Markdown → ChromaDB
 │   ├── search.py           # Step 3 動作確認: CLI 検索
 │   ├── pipeline.py         # Step 4: フォルダ監視で全自動化
 │   ├── sync_webui.py       # Step 5: Open WebUI Knowledge 自動同期
 │   ├── service_manager.py  # GUI からの Ollama / Pipeline / Open WebUI 管理
+│   ├── desktop_bridge.py   # 手元PC UI と pipeline の共有ヘルパー
+│   ├── remote_services.py  # NAS 経由リモートサービス制御の共有ヘルパー
+│   ├── remote_service_agent.py # リモートPC常駐: サービスON/OFFと状態公開
 │   ├── retry_tracker.py    # 失敗ファイルのリトライ回数・隔離履歴管理
 │   ├── note_viewer.py      # Open WebUI 不要の軽量ノートビューア
 │   ├── record_gui.cmd      # 録音 GUI 直接起動用ランチャ
@@ -860,29 +865,35 @@ python scripts/sync_webui.py
 
 ### F. リモートPC運用構成（社内NAS共有・パターンB）
 
-GPU を持つ別の本番 PC で重い処理（文字起こし・要約・DB・Open WebUI ホスティング）を動かし、手元 PC からは「録音」と「Teams/iPhone のテキスト投入」「ブラウザでの検索チャット」だけを行う構成。社内 LAN・固定 IP・社内 NAS（社外秘データを置いてよい場所）が前提です。
+GPU を持つ別の本番 PC で重い処理（文字起こし・要約・DB・Open WebUI ホスティング）を動かし、手元 PC からは Apple 風ミニマル UI の `record_gui.py` で「録音」「ファイル投入」「処理状況確認」「要約参照」だけを行う構成。社内 LAN・固定 IP・社内 NAS（社外秘データを置いてよい場所）が前提です。
 
 #### アーキテクチャ
 
 ```
-[手元PC]                                              [リモートPC (RTX Pro 2000 16GB)]
-record_mic.py で録音 ─┐                            ┌─ pipeline.py 監視
-Teams .docx / .txt   ─┤                            │   transcribe → summarize → ingest_db
-                      ▼                            │                                   → sync_webui
-       \\<NAS>\PersonalRAG\input\          ───────▶│  Open WebUI (--host 0.0.0.0:3000)
-       \\<NAS>\PersonalRAG\input_text\     ───────▶│
-                                                   │
-ブラウザ http://<REMOTE-IP>:3000 ◀──────HTTP───────┘
+[手元PC]                                                   [リモートPC (RTX Pro 2000 16GB)]
+record_gui.py: 録音 / DnD投入 ─┐                         ┌─ pipeline.py 監視
+処理状況・要約ビュー          │                         │   transcribe → summarize → ingest_db
+                               ▼                         │                                   → sync_webui
+       \\<NAS>\PersonalRAG\input\               ───────▶│  Open WebUI (--host 0.0.0.0:3000)
+       \\<NAS>\PersonalRAG\input_text\          ───────▶│
+       \\<NAS>\PersonalRAG\status\pipeline_state.json ◀──┤
+       \\<NAS>\PersonalRAG\summaries\           ◀────────┘
+       \\<NAS>\PersonalRAG\control\             ⇄ remote_service_agent.py
+
+ブラウザ http://<REMOTE-IP>:3000 ◀──────────HTTP──────────┘
 ```
 
 **ポイント**:
 - 両PCが NAS の同じパス（例 `\\nas-server\share\PersonalRAG\input\`）を `data/input/` として参照する
+- 手元PCアプリはリモートPCの PID を見ず、NAS 上の `status\pipeline_state.json` の更新時刻で稼働状況を判定する
+- リモートPCは要約成功後、手元PC参照用に `summaries\` へ `.md` をコピーする
+- Ollama / Pipeline / Open WebUI のON/OFFは、手元PCが `control\commands\` へ操作JSONを書き、リモートPCの `remote_service_agent.py` が実行する
 - リモートPC内の `ChromaDB` だけは絶対にローカル SSD に置く（SQLite ロック競合で破損するため）
 - `scripts/config_loader.py` の `resolve_path()` が UNC パスを素通しするため、`settings.yaml` に直接 `\\nas-server\...` と書ける
 
 #### F-1. NAS 上に共有フォルダを作る
 
-NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リモートPC・手元 PC の両方の Windows ユーザーアカウントに **「変更」権限**を付与（Everyone は不可、社外秘データ漏洩防止）。
+NAS 上で `PersonalRAG\input\`、`PersonalRAG\input_text\`、`PersonalRAG\status\`、`PersonalRAG\summaries\`、`PersonalRAG\control\` を作成し、リモートPC・手元 PC の両方の Windows ユーザーアカウントに **「変更」権限**を付与（Everyone は不可、社外秘データ漏洩防止）。
 
 #### F-2. リモートPC側の設定
 
@@ -895,6 +906,8 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
      input_text_dir: \\nas-server\share\PersonalRAG\input_text
      processed_dir: \\nas-server\share\PersonalRAG\input\processed
      processed_text_dir: \\nas-server\share\PersonalRAG\input_text\processed
+     published_notes_dir: \\nas-server\share\PersonalRAG\summaries
+     remote_control_dir: \\nas-server\share\PersonalRAG\control
 
      # 中間ファイル・DB はリモートPCのローカルディスクに残す
      transcripts_dir: data/transcripts
@@ -902,6 +915,9 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
      chromadb_dir: data/chromadb        # ← 絶対 NAS に置かない（SQLite ロック対策）
      recordings_dir: data/input         # ← リモートでは未使用
      logs_dir: data/logs
+
+   pipeline:
+     state_file: \\nas-server\share\PersonalRAG\status\pipeline_state.json
    ```
 3. Open WebUI を **LAN 公開**で起動:
    ```powershell
@@ -911,7 +927,10 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
 4. Windows ファイアウォール:
    - 「Windows Defender ファイアウォール」→「詳細設定」→「受信の規則」→「新規」
    - 種類「ポート」→ TCP `3000` → 許可 → プロファイル「**ドメイン**」「**プライベート**」のみチェック（**パブリックは外す**）→ 名前「Open WebUI LAN」
-5. `python scripts/pipeline.py` で監視開始（NAS パスを watch）
+5. `python scripts/remote_service_agent.py` を起動
+   - これが手元PCからの Ollama / Pipeline / Open WebUI のON/OFF要求を処理します
+   - `control\service_status.json` に状態を定期的に公開します
+6. 初回だけ直接 `python scripts/pipeline.py` を起動してもよいですが、通常は手元PCの「サービス」タブから Pipeline をONにします
 
 #### F-3. 手元 PC 側の設定
 
@@ -922,15 +941,17 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
    cd PersonalRAG
    python -m venv .venv-client
    .\.venv-client\Scripts\Activate.ps1
-   pip install sounddevice soundfile numpy pyyaml python-dotenv
+   pip install sounddevice soundfile numpy pyyaml python-dotenv requests pystray Pillow tkinterdnd2 winotify
    ```
 2. `config/settings.yaml` を新規作成（または `settings.dev.yaml` をコピーして編集）:
    ```yaml
    paths:
      recordings_dir: \\nas-server\share\PersonalRAG\input    # ← NAS の input と同じ
-     # 以下は record_mic.py からは参照されないが、エラー回避のため一応書いておく
-     input_dir: data/input
-     input_text_dir: data/input_text
+     input_dir: \\nas-server\share\PersonalRAG\input
+     input_text_dir: \\nas-server\share\PersonalRAG\input_text
+     published_notes_dir: \\nas-server\share\PersonalRAG\summaries
+     remote_pipeline_state_file: \\nas-server\share\PersonalRAG\status\pipeline_state.json
+     remote_control_dir: \\nas-server\share\PersonalRAG\control
      processed_dir: data/input/processed
      processed_text_dir: data/input_text/processed
      transcripts_dir: data/transcripts
@@ -942,6 +963,14 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
      sample_rate: 16000
      channels: 1
      format: wav
+
+   pipeline:
+     watch_extensions: [".wav", ".mp3", ".m4a", ".flac", ".ogg"]
+     text_extensions: [".txt", ".vtt", ".docx", ".md"]
+
+   ui:
+     local_service_management: false
+     pipeline_stale_seconds: 30
    ```
 3. **NAS への認証情報を Windows に覚えさせる**: エクスプローラのアドレスバーに `\\nas-server\share\` と入力 → 認証ダイアログで「資格情報を記憶する」にチェック
 
@@ -949,13 +978,16 @@ NAS 上で `PersonalRAG\input\` と `PersonalRAG\input_text\` を作成し、リ
 
 | 操作 | 手元PCで | リモートPCで |
 |---|---|---|
-| マイク録音 | `python scripts/record_mic.py` | 録音終了後、NAS の `input\` を監視して自動処理 |
-| 外部録音投入 | エクスプローラで `\\nas-server\share\PersonalRAG\input\` にコピー | 文字起こし → 要約 → ChromaDB 投入 |
-| 書き起こし / Markdown 投入 | `.vtt` / `.docx` / `.txt` / `.md` を `\\nas-server\share\PersonalRAG\input_text\` にコピー | 正規化 → 再要約 → ChromaDB 投入 |
+| マイク録音 | `python scripts/record_gui.py` の「録音」タブ | 録音終了後、NAS の `input\` を監視して自動処理 |
+| 外部録音投入 | 「ファイル投入」タブへドラッグ＆ドロップ | 文字起こし → 要約 → ChromaDB 投入 |
+| 書き起こし / Markdown 投入 | `.vtt` / `.docx` / `.txt` / `.md` を「ファイル投入」タブへドラッグ＆ドロップ | 正規化 → 再要約 → ChromaDB 投入 |
+| 処理状況確認 | 「処理状況」タブで現在ステップ・待ち件数・直近成功/失敗を確認 | `status\pipeline_state.json` を更新 |
+| 要約参照 | 「要約」タブで `summaries\` の `.md` を一覧・検索・プレビュー | 成功した要約を `summaries\` へ公開コピー |
+| サービスON/OFF | 「サービス」タブで Ollama / Pipeline / Open WebUI をON/OFF | `remote_service_agent.py` が操作を実行 |
 | 検索・チャット | ブラウザで `http://<REMOTE-IP>:3000` | （何もしない） |
 | ログ確認 | 必要時のみ RDP でリモートにログイン | RDP で `data/logs/pipeline.log` |
 
-この構成では、手元 PC は録音・ファイル投入だけを担当し、文字起こし・要約・RAG 追加は
+この構成では、手元 PC は録音・ファイル投入・状態確認・要約参照だけを担当し、文字起こし・要約・RAG 追加は
 リモート PC 上の `pipeline.py` が実行します。`input\` / `input_text\` は NAS 共有、
 `transcripts_dir` / `notes_dir` / `chromadb_dir` はリモート PC のローカルディスクに置きます。
 Open WebUI Knowledge への自動同期まで使う場合は、リモート PC 側で `openwebui.enabled`、
@@ -965,9 +997,13 @@ Open WebUI Knowledge への自動同期まで使う場合は、リモート PC �
 
 1. ✅ 手元 PC のエクスプローラで `\\nas-server\share\PersonalRAG\input\` が開ける
 2. ✅ リモートPCで `python scripts/pipeline.py` を起動した状態で、手元 PC から NAS へ .wav をコピーすると即座に処理が走る
-3. ✅ 手元 PC で `python scripts/record_mic.py` を実行し、録音停止後に NAS に .wav が保存される
-4. ✅ 手元 PC のブラウザで `http://<REMOTE-IP>:3000` が開ける（Open WebUI ログイン画面が出る）
-5. ✅ Open WebUI のチャットで先ほどの録音内容が Knowledge から引用されて回答される
+3. ✅ 手元 PC で `python scripts/record_gui.py` を実行し、録音停止後に NAS に .wav が保存される
+4. ✅ リモートPCで `python scripts/remote_service_agent.py` を起動し、手元PCの「サービス」タブに状態が出る
+5. ✅ 手元PCの「サービス」タブから Pipeline をON/OFFできる
+6. ✅ 手元 PC の「処理状況」タブで `pipeline_state.json` の更新が見える
+7. ✅ 処理完了後、手元 PC の「要約」タブに `summaries\` の `.md` が表示される
+8. ✅ 手元 PC のブラウザで `http://<REMOTE-IP>:3000` が開ける（Open WebUI ログイン画面が出る）
+9. ✅ Open WebUI のチャットで先ほどの録音内容が Knowledge から引用されて回答される
 
 #### F-6. 注意点
 

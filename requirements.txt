@@ -37,4 +37,5 @@ python-dotenv>=1.0.1
 # キー監視用の追加依存は不要。トースト通知のみ winotify を使う（Windows 10/11 専用）。
 pystray>=0.19.5
 Pillow>=10.0.0
+tkinterdnd2>=0.4.2
 winotify>=1.1.0 ; sys_platform == 'win32'

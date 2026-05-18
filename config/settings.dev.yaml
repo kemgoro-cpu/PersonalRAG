@@ -12,6 +12,9 @@ paths:
   chromadb_dir: data/chromadb        # ベクターDB 永続化先
   recordings_dir: data/input         # マイク録音の保存先（pipeline 監視先と同じ）
   logs_dir: data/logs                # ログ出力先
+  published_notes_dir: data/summaries # 手元PC向けの要約公開先
+  remote_pipeline_state_file: data/logs/pipeline_state.json # 手元PCが読む処理状況
+  remote_control_dir: data/control   # 手元PCとリモートPCのサービス制御用共有領域
   # テキスト取り込み用: Teams/iPhone/Zoom 等の既成文字起こしを投入する
   input_text_dir: data/input_text               # テキストファイル投入先
   processed_text_dir: data/input_text/processed # 処理済みテキストの退避先
@@ -132,3 +135,8 @@ openwebui:
   poll_timeout_seconds: 60
   # status polling の間隔（秒）
   poll_interval_seconds: 2
+
+# --- 手元PCアプリ UI 設定 ---
+ui:
+  local_service_management: false
+  pipeline_stale_seconds: 30
