@@ -117,6 +117,8 @@ fi
 # =============================================================================
 info "Step 6/12: PyTorch（CUDA 版）をインストールしています..."
 info "※ファイルサイズが大きいため時間がかかります（数分〜10分）"
+info "pip を最新版に更新しています..."
+./.venv/Scripts/python.exe -m pip install --upgrade pip
 
 # activate を使わず直接 .venv の python を呼ぶ
 # 理由: bash スクリプト内で source activate すると親シェルの状態を変えてしまうことがあり、
@@ -127,12 +129,17 @@ info "※ファイルサイズが大きいため時間がかかります（数�
 # dev は RTX 3060 の既存実績を優先して CUDA 12.1、prod は Blackwell 世代に合わせて CUDA 12.8 を使う。
 if [[ "$PROFILE" == "prod" ]]; then
     TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
+    TORCH_VERSION="2.11.0"
+    TORCHAUDIO_VERSION="2.11.0"
     info "本番機用 PyTorch wheel（CUDA 12.8）を使います。"
 else
     TORCH_INDEX_URL="https://download.pytorch.org/whl/cu121"
+    TORCH_VERSION="2.5.1"
+    TORCHAUDIO_VERSION="2.5.1"
     info "開発機用 PyTorch wheel（CUDA 12.1）を使います。"
 fi
-./.venv/Scripts/python.exe -m pip install torch torchaudio --index-url "$TORCH_INDEX_URL"
+info "torch==${TORCH_VERSION} / torchaudio==${TORCHAUDIO_VERSION} をインストールします。"
+./.venv/Scripts/python.exe -m pip install "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" --index-url "$TORCH_INDEX_URL"
 
 # =============================================================================
 # Step 7/12: requirements.txt の依存ライブラリをインストール

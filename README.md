@@ -189,13 +189,13 @@ PyTorch は GPU 世代に合わせた CUDA wheel を先に入れる（faster-whi
 **開発機 (RTX 3060 / Ampere):**
 
 ```powershell
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 ```
 
 **本番機 (RTX Pro 2000 Blackwell):**
 
 ```powershell
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 #### 3. 残りの依存ライブラリ

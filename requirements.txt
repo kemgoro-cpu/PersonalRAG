@@ -1,8 +1,8 @@
 # PersonalRAG - 依存ライブラリ一覧
 # インストール方法:
 #   1. PyTorch (CUDA版) を先にインストール:
-#      開発機: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-#      本番機: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+#      開発機: pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#      本番機: pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 #   2. その後:
 #      pip install -r requirements.txt
 
