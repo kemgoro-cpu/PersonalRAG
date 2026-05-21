@@ -33,6 +33,10 @@ def make_manager(tmp_path: Path, port: int = 3000) -> ServiceManager:
             "lock_file": str(tmp_path / "pipeline.lock"),
         },
         "llm": {"host": "http://localhost:11434"},
+        "embedding": {
+            "model": "nomic-embed-text",
+            "host": "http://localhost:11434",
+        },
         "openwebui": {"base_url": f"http://localhost:{port}"},
     }
     return ServiceManager(tmp_path, settings)
@@ -46,6 +50,10 @@ def make_sync_enabled_manager(tmp_path: Path, port: int = 3000) -> ServiceManage
             "lock_file": str(tmp_path / "pipeline.lock"),
         },
         "llm": {"host": "http://localhost:11434"},
+        "embedding": {
+            "model": "nomic-embed-text",
+            "host": "http://localhost:11434",
+        },
         "openwebui": {
             "enabled": True,
             "base_url": f"http://localhost:{port}",
@@ -205,7 +213,7 @@ def test_start_open_webui_forces_utf8_stdout_environment(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    """Windows cp932 で Open WebUI の Unicode バナーが落ちないよう UTF-8 を渡す。"""
+    """Open WebUI 起動時は UTF-8 とオフライン向け埋め込み設定を渡す。"""
     create_webui_exe(tmp_path)
     mgr = make_manager(tmp_path)
     captured: dict[str, Any] = {}
@@ -231,6 +239,15 @@ def test_start_open_webui_forces_utf8_stdout_environment(
     assert ok is True
     assert captured["env"]["PYTHONIOENCODING"] == "utf-8"
     assert captured["env"]["PYTHONUTF8"] == "1"
+    assert captured["env"]["OFFLINE_MODE"] == "true"
+    assert captured["env"]["HF_HUB_OFFLINE"] == "1"
+    assert captured["env"]["ENABLE_VERSION_UPDATE_CHECK"] == "false"
+    assert captured["env"]["RAG_EMBEDDING_ENGINE"] == "ollama"
+    assert captured["env"]["RAG_EMBEDDING_MODEL"] == "nomic-embed-text"
+    assert captured["env"]["OLLAMA_BASE_URL"] == "http://localhost:11434"
+    assert captured["env"]["RAG_EMBEDDING_MODEL_AUTO_UPDATE"] == "false"
+    assert captured["env"]["RAG_RERANKING_MODEL_AUTO_UPDATE"] == "false"
+    assert captured["env"]["WHISPER_MODEL_AUTO_UPDATE"] == "false"
 
 
 def test_start_open_webui_queues_pending_sync_when_enabled(

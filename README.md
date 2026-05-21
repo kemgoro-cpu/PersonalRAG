@@ -260,6 +260,14 @@ cd /c/Users/kemgo/Documents/Program/PersonalRAG
 python -m venv .venv-webui
 source .venv-webui/Scripts/activate
 pip install open-webui==0.9.5
+export OFFLINE_MODE=true
+export HF_HUB_OFFLINE=1
+export RAG_EMBEDDING_ENGINE=ollama
+export RAG_EMBEDDING_MODEL=nomic-embed-text
+export OLLAMA_BASE_URL=http://localhost:11434
+export RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
+export RAG_RERANKING_MODEL_AUTO_UPDATE=false
+export WHISPER_MODEL_AUTO_UPDATE=false
 open-webui serve --port 3000
 ```
 
@@ -269,6 +277,14 @@ cd C:\Users\kemgo\Documents\Program\PersonalRAG
 python -m venv .venv-webui
 .\.venv-webui\Scripts\Activate.ps1
 pip install open-webui==0.9.5
+$env:OFFLINE_MODE="true"
+$env:HF_HUB_OFFLINE="1"
+$env:RAG_EMBEDDING_ENGINE="ollama"
+$env:RAG_EMBEDDING_MODEL="nomic-embed-text"
+$env:OLLAMA_BASE_URL="http://localhost:11434"
+$env:RAG_EMBEDDING_MODEL_AUTO_UPDATE="false"
+$env:RAG_RERANKING_MODEL_AUTO_UPDATE="false"
+$env:WHISPER_MODEL_AUTO_UPDATE="false"
 open-webui serve --port 3000
 ```
 
@@ -280,6 +296,14 @@ open-webui serve --port 3000
 ```bash
 cd /c/Users/kemgo/Documents/Program/PersonalRAG
 source .venv-webui/Scripts/activate
+export OFFLINE_MODE=true
+export HF_HUB_OFFLINE=1
+export RAG_EMBEDDING_ENGINE=ollama
+export RAG_EMBEDDING_MODEL=nomic-embed-text
+export OLLAMA_BASE_URL=http://localhost:11434
+export RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
+export RAG_RERANKING_MODEL_AUTO_UPDATE=false
+export WHISPER_MODEL_AUTO_UPDATE=false
 open-webui serve --port 3000
 ```
 このターミナルは閉じずに開いたままにしておきます（Ctrl+C で停止）。
@@ -811,6 +835,14 @@ pip install -r requirements.txt
 
 # 3. WebUI を別ターミナルで起動
 source .venv-webui/Scripts/activate
+export OFFLINE_MODE=true
+export HF_HUB_OFFLINE=1
+export RAG_EMBEDDING_ENGINE=ollama
+export RAG_EMBEDDING_MODEL=nomic-embed-text
+export OLLAMA_BASE_URL=http://localhost:11434
+export RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
+export RAG_RERANKING_MODEL_AUTO_UPDATE=false
+export WHISPER_MODEL_AUTO_UPDATE=false
 open-webui serve --port 3000
 
 # 4. Knowledge を作成して ID を確認
@@ -922,6 +954,14 @@ NAS 上で `PersonalRAG\input\`、`PersonalRAG\input_text\`、`PersonalRAG\statu
 3. Open WebUI を **LAN 公開**で起動:
    ```powershell
    .\.venv-webui\Scripts\Activate.ps1
+   $env:OFFLINE_MODE="true"
+   $env:HF_HUB_OFFLINE="1"
+   $env:RAG_EMBEDDING_ENGINE="ollama"
+   $env:RAG_EMBEDDING_MODEL="nomic-embed-text"
+   $env:OLLAMA_BASE_URL="http://localhost:11434"
+   $env:RAG_EMBEDDING_MODEL_AUTO_UPDATE="false"
+   $env:RAG_RERANKING_MODEL_AUTO_UPDATE="false"
+   $env:WHISPER_MODEL_AUTO_UPDATE="false"
    open-webui serve --port 3000 --host 0.0.0.0
    ```
 4. Windows ファイアウォール:

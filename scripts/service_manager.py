@@ -144,6 +144,12 @@ class ServiceManager:
             "host", "http://localhost:11434"
         ).rstrip("/")
 
+        embedding_cfg = settings.get("embedding", {})
+        self._embedding_model: str = embedding_cfg.get("model", "nomic-embed-text")
+        self._embedding_base_url: str = embedding_cfg.get(
+            "host", self._ollama_base_url
+        ).rstrip("/")
+
         # Open WebUI の URL（settings の openwebui.base_url から取得）
         self._webui_base_url: str = settings.get("openwebui", {}).get(
             "base_url", "http://localhost:3000"
@@ -818,6 +824,17 @@ class ServiceManager:
             # Windows の既定 cp932 では UnicodeEncodeError で落ちるため UTF-8 を強制する。
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
+            # 社内ネットワークで Hugging Face への自動フェッチが止まるのを避ける。
+            # Knowledge の埋め込みは、PersonalRAG でも使う Ollama の nomic-embed-text に寄せる。
+            env["OFFLINE_MODE"] = "true"
+            env["HF_HUB_OFFLINE"] = "1"
+            env["ENABLE_VERSION_UPDATE_CHECK"] = "false"
+            env["RAG_EMBEDDING_ENGINE"] = "ollama"
+            env["RAG_EMBEDDING_MODEL"] = self._embedding_model
+            env["OLLAMA_BASE_URL"] = self._embedding_base_url
+            env["RAG_EMBEDDING_MODEL_AUTO_UPDATE"] = "false"
+            env["RAG_RERANKING_MODEL_AUTO_UPDATE"] = "false"
+            env["WHISPER_MODEL_AUTO_UPDATE"] = "false"
 
             self._logs_dir.mkdir(parents=True, exist_ok=True)
             stdout_path = self._logs_dir / "open_webui_stdout.log"
