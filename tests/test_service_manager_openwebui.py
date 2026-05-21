@@ -25,8 +25,13 @@ class DummyProcess:
         return self.returncode
 
 
-def make_manager(tmp_path: Path, port: int = 3000) -> ServiceManager:
+def make_manager(
+    tmp_path: Path, port: int = 3000, bind_host: str | None = None
+) -> ServiceManager:
     """テスト用 ServiceManager を作成する。"""
+    openwebui_cfg: dict[str, Any] = {"base_url": f"http://localhost:{port}"}
+    if bind_host is not None:
+        openwebui_cfg["bind_host"] = bind_host
     settings = {
         "pipeline": {
             "state_file": str(tmp_path / "pipeline_state.json"),
@@ -37,7 +42,7 @@ def make_manager(tmp_path: Path, port: int = 3000) -> ServiceManager:
             "model": "nomic-embed-text",
             "host": "http://localhost:11434",
         },
-        "openwebui": {"base_url": f"http://localhost:{port}"},
+        "openwebui": openwebui_cfg,
     }
     return ServiceManager(tmp_path, settings)
 
@@ -207,6 +212,37 @@ def test_start_open_webui_uses_configured_port_and_project_root(
     assert captured["cmd"][-2:] == ["--port", "3456"]
     assert captured["cwd"] == str(tmp_path)
     assert "13579" in msg
+
+
+def test_start_open_webui_uses_configured_bind_host(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """openwebui.bind_host がある場合は --host を付けて起動する。"""
+    create_webui_exe(tmp_path)
+    mgr = make_manager(tmp_path, port=3456, bind_host="0.0.0.0")
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        mgr,
+        "check_open_webui",
+        lambda: ServiceInfo(
+            name="Open WebUI",
+            status=ServiceStatus.STOPPED,
+            detail="停止中",
+        ),
+    )
+
+    def fake_popen(cmd: list[str], **_kwargs: Any) -> DummyProcess:
+        captured["cmd"] = cmd
+        return DummyProcess(pid=24601)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    ok, _msg = mgr.start_open_webui()
+
+    assert ok is True
+    assert captured["cmd"][-4:] == ["--port", "3456", "--host", "0.0.0.0"]
 
 
 def test_start_open_webui_forces_utf8_stdout_environment(

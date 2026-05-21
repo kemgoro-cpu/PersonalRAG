@@ -151,9 +151,11 @@ class ServiceManager:
         ).rstrip("/")
 
         # Open WebUI の URL（settings の openwebui.base_url から取得）
-        self._webui_base_url: str = settings.get("openwebui", {}).get(
+        openwebui_cfg = settings.get("openwebui", {})
+        self._webui_base_url: str = openwebui_cfg.get(
             "base_url", "http://localhost:3000"
         ).rstrip("/")
+        self._webui_bind_host: str = str(openwebui_cfg.get("bind_host", "")).strip()
 
         notes_dir_rel: str = settings.get("paths", {}).get("notes_dir", "data/notes")
         notes_path = Path(notes_dir_rel)
@@ -840,8 +842,11 @@ class ServiceManager:
             stdout_path = self._logs_dir / "open_webui_stdout.log"
             stderr_path = self._logs_dir / "open_webui_stderr.log"
             with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+                cmd = [str(webui_exe), "serve", "--port", str(webui_port)]
+                if self._webui_bind_host:
+                    cmd.extend(["--host", self._webui_bind_host])
                 proc = subprocess.Popen(
-                    [str(webui_exe), "serve", "--port", str(webui_port)],
+                    cmd,
                     cwd=str(self.project_root),
                     creationflags=_hidden_creationflags(CREATE_NEW_PROCESS_GROUP),
                     startupinfo=_hidden_startupinfo(),

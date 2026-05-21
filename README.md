@@ -49,8 +49,9 @@ PersonalRAG/
 │   ├── note_viewer.py      # Open WebUI 不要の軽量ノートビューア
 │   ├── record_gui.cmd      # 録音 GUI 直接起動用ランチャ
 │   ├── note_viewer.cmd     # ノートビューア直接起動用ランチャ
-│   ├── setup.sh            # セットアップスクリプト（Git Bash 用）
-│   └── setup.ps1           # セットアップスクリプト（PowerShell 用）
+│   ├── setup.py            # 対話式セットアップ本体
+│   ├── setup.sh            # セットアップ入口（Git Bash 用）
+│   └── setup.ps1           # セットアップ入口（PowerShell 用）
 ├── config/
 │   ├── settings.yaml       # 現在の設定（.gitignore で管理外。下記プロファイルから生成）
 │   ├── settings.dev.yaml   # 開発機 (RTX 3060 6GB) 向けプロファイル
@@ -61,6 +62,7 @@ PersonalRAG/
 ├── .gitignore
 ├── PersonalRAG.cmd         # インストール不要のダブルクリック起動
 ├── requirements.txt
+├── requirements-client.txt # 手元PCクライアント用の最小依存
 └── README.md
 ```
 
@@ -68,55 +70,50 @@ PersonalRAG/
 
 ## セットアップ手順
 
-### クイックセットアップ（推奨）
+### 対話式セットアップ（推奨）
 
-スクリプト 1 つで venv 作成・依存インストール・設定適用・モデル取得を一括実行します。
-
-#### Git Bash
-
-```bash
-cd /c/Users/kemgo/Documents/Program/PersonalRAG
-./scripts/setup.sh dev      # 開発機の場合
-# または
-./scripts/setup.sh prod     # 本番機の場合
-```
-
-#### PowerShell
+PowerShell で以下を実行すると、端末上の質問に答えるだけで venv 作成・依存インストール・`settings.yaml` 生成・`.env` 生成・必要フォルダ作成まで進みます。
 
 ```powershell
 cd C:\Users\kemgo\Documents\Program\PersonalRAG
-.\scripts\setup.ps1 dev     # 開発機の場合
-# または
-.\scripts\setup.ps1 prod    # 本番機の場合
+.\scripts\setup.ps1
 ```
+
+Git Bash でも同じウィザードを使えます。
+
+```bash
+cd /c/Users/kemgo/Documents/Program/PersonalRAG
+./scripts/setup.sh
+```
+
+ウィザードで選べる利用形態:
+
+| 利用形態 | 用途 |
+|---|---|
+| `local` | このPCだけで録音・文字起こし・要約・Open WebUI を動かす |
+| `remote-server` | GPU付きリモートPCで重い処理と Open WebUI を動かす |
+| `remote-client` | 手元PCで録音・投入・状態確認だけを行う |
+
+よく使う指定例:
+
+```powershell
+.\scripts\setup.ps1 local --profile dev
+.\scripts\setup.ps1 remote-server \\NAS\share\PersonalRAG
+.\scripts\setup.ps1 remote-client \\NAS\share\PersonalRAG
+```
+
+`remote-server` / `remote-client` では、共有ルートだけ指定すれば `input`、`input_text`、`status`、`summaries`、`control` は自動作成されます。
 
 > PowerShell でスクリプト実行が `セキュリティエラー` になる場合は、実行ポリシーを一時的に変更してください:
 > ```powershell
 > Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 > ```
 
-### セットアップ後の手動作業
+### セットアップ後の確認
 
-スクリプト完了後、以下を手動で行ってください。
+Hugging Face token、Open WebUI API key、Knowledge ID は未入力でもセットアップ完了できます。未入力の項目は最後に「残りの確認」として表示されるので、必要になったタイミングで `.env` と `config/settings.yaml` に追記してください。
 
-1. **`.env` ファイルを作成**（`.env.example` をコピーして HF トークンを記入）
-
-   ```powershell
-   Copy-Item .env.example .env
-   # .env をテキストエディタで開いて HUGGINGFACE_TOKEN=hf_xxx の xxx 部分を書き換える
-   ```
-
-2. **Hugging Face で利用規約に同意**（話者分離モデルに必要）
-   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-   - 各ページの「Agree and access repository」ボタンを押す
-
-3. **`OLLAMA_KEEP_ALIVE=0` 環境変数を設定**（任意、VRAM 競合回避）
-
-   ```powershell
-   # システム環境変数に設定（PC を再起動するとOllama に反映）
-   setx OLLAMA_KEEP_ALIVE "0"
-   ```
+話者分離を使う場合は、[pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) と [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) の利用規約に同意してください。
 
 ### 環境別の差分
 
@@ -923,96 +920,25 @@ record_gui.py: 録音 / DnD投入 ─┐                         ┌─ pipeline
 - リモートPC内の `ChromaDB` だけは絶対にローカル SSD に置く（SQLite ロック競合で破損するため）
 - `scripts/config_loader.py` の `resolve_path()` が UNC パスを素通しするため、`settings.yaml` に直接 `\\nas-server\...` と書ける
 
-#### F-1. NAS 上に共有フォルダを作る
+#### F-1. NAS 上に共有ルートを用意する
 
-NAS 上で `PersonalRAG\input\`、`PersonalRAG\input_text\`、`PersonalRAG\status\`、`PersonalRAG\summaries\`、`PersonalRAG\control\` を作成し、リモートPC・手元 PC の両方の Windows ユーザーアカウントに **「変更」権限**を付与（Everyone は不可、社外秘データ漏洩防止）。
+NAS 上に `\\nas-server\share\PersonalRAG` のような共有ルートを 1 つ用意し、リモートPC・手元PCの両方の Windows ユーザーアカウントに **「変更」権限**を付与します。`input`、`input_text`、`status`、`summaries`、`control` はセットアップウィザードが自動作成します。
 
 #### F-2. リモートPC側の設定
 
-1. 既存の「クイックセットアップ → prod プロファイル」を完了させる
-2. `config/settings.yaml` の `paths` セクションを編集:
-   ```yaml
-   paths:
-     # 両PCが触る分は NAS パスに
-     input_dir: \\nas-server\share\PersonalRAG\input
-     input_text_dir: \\nas-server\share\PersonalRAG\input_text
-     processed_dir: \\nas-server\share\PersonalRAG\input\processed
-     processed_text_dir: \\nas-server\share\PersonalRAG\input_text\processed
-     published_notes_dir: \\nas-server\share\PersonalRAG\summaries
-     remote_control_dir: \\nas-server\share\PersonalRAG\control
+```powershell
+.\scripts\setup.ps1 remote-server \\nas-server\share\PersonalRAG
+```
 
-     # 中間ファイル・DB はリモートPCのローカルディスクに残す
-     transcripts_dir: data/transcripts
-     notes_dir: data/notes
-     chromadb_dir: data/chromadb        # ← 絶対 NAS に置かない（SQLite ロック対策）
-     recordings_dir: data/input         # ← リモートでは未使用
-     logs_dir: data/logs
-
-   pipeline:
-     state_file: \\nas-server\share\PersonalRAG\status\pipeline_state.json
-   ```
-3. Open WebUI を **LAN 公開**で起動:
-   ```powershell
-   .\.venv-webui\Scripts\Activate.ps1
-   $env:OFFLINE_MODE="true"
-   $env:HF_HUB_OFFLINE="1"
-   $env:RAG_EMBEDDING_ENGINE="ollama"
-   $env:RAG_EMBEDDING_MODEL="nomic-embed-text"
-   $env:OLLAMA_BASE_URL="http://localhost:11434"
-   $env:RAG_EMBEDDING_MODEL_AUTO_UPDATE="false"
-   $env:RAG_RERANKING_MODEL_AUTO_UPDATE="false"
-   $env:WHISPER_MODEL_AUTO_UPDATE="false"
-   open-webui serve --port 3000 --host 0.0.0.0
-   ```
-4. Windows ファイアウォール:
-   - 「Windows Defender ファイアウォール」→「詳細設定」→「受信の規則」→「新規」
-   - 種類「ポート」→ TCP `3000` → 許可 → プロファイル「**ドメイン**」「**プライベート**」のみチェック（**パブリックは外す**）→ 名前「Open WebUI LAN」
-5. `python scripts/remote_service_agent.py` を起動
-   - これが手元PCからの Ollama / Pipeline / Open WebUI のON/OFF要求を処理します
-   - `control\service_status.json` に状態を定期的に公開します
-6. 初回だけ直接 `python scripts/pipeline.py` を起動してもよいですが、通常は手元PCの「サービス」タブから Pipeline をONにします
+ウィザードが `config/settings.yaml` を生成し、Open WebUI を LAN 公開するための `openwebui.bind_host: 0.0.0.0` と、手元PCが読む `control\connection.json` を作成します。完了後は Windows Firewall で TCP `3000` を「ドメイン」「プライベート」のみ許可し、`python scripts/remote_service_agent.py` を起動してください。
 
 #### F-3. 手元 PC 側の設定
 
-1. リポジトリ clone + **最小依存だけ**インストール（Ollama / faster-whisper / pyannote は不要）:
-   ```powershell
-   cd C:\path\to\your\workspace
-   git clone https://github.com/kemgoro-cpu/PersonalRAG
-   cd PersonalRAG
-   python -m venv .venv-client
-   .\.venv-client\Scripts\Activate.ps1
-   pip install sounddevice soundfile numpy pyyaml python-dotenv requests pystray Pillow tkinterdnd2 winotify
-   ```
-2. `config/settings.yaml` を新規作成（または `settings.dev.yaml` をコピーして編集）:
-   ```yaml
-   paths:
-     recordings_dir: \\nas-server\share\PersonalRAG\input    # ← NAS の input と同じ
-     input_dir: \\nas-server\share\PersonalRAG\input
-     input_text_dir: \\nas-server\share\PersonalRAG\input_text
-     published_notes_dir: \\nas-server\share\PersonalRAG\summaries
-     remote_pipeline_state_file: \\nas-server\share\PersonalRAG\status\pipeline_state.json
-     remote_control_dir: \\nas-server\share\PersonalRAG\control
-     processed_dir: data/input/processed
-     processed_text_dir: data/input_text/processed
-     transcripts_dir: data/transcripts
-     notes_dir: data/notes
-     chromadb_dir: data/chromadb
-     logs_dir: data/logs
+```powershell
+.\scripts\setup.ps1 remote-client \\nas-server\share\PersonalRAG
+```
 
-   recording:
-     sample_rate: 16000
-     channels: 1
-     format: wav
-
-   pipeline:
-     watch_extensions: [".wav", ".mp3", ".m4a", ".flac", ".ogg"]
-     text_extensions: [".txt", ".vtt", ".docx", ".md"]
-
-   ui:
-     local_service_management: false
-     pipeline_stale_seconds: 30
-   ```
-3. **NAS への認証情報を Windows に覚えさせる**: エクスプローラのアドレスバーに `\\nas-server\share\` と入力 → 認証ダイアログで「資格情報を記憶する」にチェック
+手元PCには `requirements-client.txt` の最小依存だけが入ります。リモートPC側で作られた `control\connection.json` があれば、Open WebUI の接続先は自動で読み込まれます。NAS への認証情報は、エクスプローラで `\\nas-server\share\` を開いて「資格情報を記憶する」にチェックしてください。
 
 #### F-4. 日常運用
 
