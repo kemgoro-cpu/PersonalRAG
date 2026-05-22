@@ -86,6 +86,8 @@ cd /c/Users/kemgo/Documents/Program/PersonalRAG
 ./scripts/setup.sh
 ```
 
+プロキシが必要なネットワークでは、ウィザード内の質問に `y` と答えてプロキシURLを入力してください。非対話で指定する場合は `--proxy-url http://proxy:port` を渡すと、pip 系のインストールコマンドに `--proxy=http://proxy:port` が付きます。
+
 ウィザードで選べる利用形態:
 
 | 利用形態 | 用途 |

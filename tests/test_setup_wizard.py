@@ -118,9 +118,13 @@ def test_remote_client_uses_client_dependency_installer(
     monkeypatch: Any,
 ) -> None:
     setup = load_setup_module()
-    calls: list[Path] = []
+    calls: list[tuple[Path, str]] = []
 
-    monkeypatch.setattr(setup, "install_client_dependencies", lambda root: calls.append(root))
+    monkeypatch.setattr(
+        setup,
+        "install_client_dependencies",
+        lambda root, proxy_url="": calls.append((root, proxy_url)),
+    )
     monkeypatch.setattr(
         setup,
         "install_main_dependencies",
@@ -132,6 +136,55 @@ def test_remote_client_uses_client_dependency_installer(
         lambda *_args: (_ for _ in ()).throw(AssertionError("webui installer should not run")),
     )
 
-    setup.install_dependencies(tmp_path, setup.SetupAnswers(mode="remote-client"))
+    setup.install_dependencies(
+        tmp_path,
+        setup.SetupAnswers(mode="remote-client", proxy_url="proxy.local:8080"),
+    )
 
-    assert calls == [tmp_path]
+    assert calls == [(tmp_path, "http://proxy.local:8080")]
+
+
+def test_run_pip_appends_proxy_argument(tmp_path: Path, monkeypatch: Any) -> None:
+    setup = load_setup_module()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> None:
+        calls.append(cmd)
+
+    monkeypatch.setattr(setup.subprocess, "run", fake_run)
+
+    setup.run_pip(
+        Path("python"),
+        ["install", "-r", "requirements-client.txt"],
+        tmp_path,
+        "proxy.local:8080",
+    )
+
+    assert calls == [
+        [
+            "python",
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            "requirements-client.txt",
+            "--proxy=http://proxy.local:8080",
+        ]
+    ]
+
+
+def test_non_interactive_proxy_url_is_normalized() -> None:
+    setup = load_setup_module()
+    args = setup.parse_args(
+        [
+            "local",
+            "--non-interactive",
+            "--skip-install",
+            "--proxy-url",
+            "proxy.local:8080",
+        ]
+    )
+
+    answers = setup.collect_answers(args)
+
+    assert answers.proxy_url == "http://proxy.local:8080"

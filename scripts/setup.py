@@ -30,6 +30,7 @@ class SetupAnswers:
     huggingface_token: str = ""
     openwebui_api_key: str = ""
     knowledge_id: str = ""
+    proxy_url: str = ""
     set_ollama_keep_alive: bool = False
 
 
@@ -105,6 +106,25 @@ def build_webui_url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
+def normalize_proxy_url(proxy_url: str) -> str:
+    proxy_url = proxy_url.strip()
+    if not proxy_url:
+        return ""
+    if "://" not in proxy_url:
+        return f"http://{proxy_url}"
+    return proxy_url
+
+
+def ask_proxy_url() -> str:
+    while True:
+        proxy_url = normalize_proxy_url(
+            ask_text("プロキシURLを入力してください（例: http://proxy:port）", "")
+        )
+        if proxy_url:
+            return proxy_url
+        print("  プロキシを使う場合は URL を入力してください。")
+
+
 def shared_path(shared_root: str, *parts: str) -> str:
     root = shared_root.rstrip("\\/")
     separator = "\\" if "\\" in root else "/"
@@ -135,6 +155,7 @@ def load_connection(shared_root: str) -> dict[str, Any] | None:
 
 def collect_answers(args: argparse.Namespace) -> SetupAnswers:
     mode, profile = normalize_mode_alias(args.mode, args.profile)
+    proxy_url = normalize_proxy_url(args.proxy_url)
     if args.non_interactive:
         if not mode:
             raise SystemExit("--non-interactive では mode を指定してください。")
@@ -161,6 +182,7 @@ def collect_answers(args: argparse.Namespace) -> SetupAnswers:
             huggingface_token=args.huggingface_token or "",
             openwebui_api_key=args.openwebui_api_key or "",
             knowledge_id=args.knowledge_id or "",
+            proxy_url=proxy_url,
             set_ollama_keep_alive=args.set_ollama_keep_alive,
         )
         validate_answers(answers)
@@ -185,6 +207,10 @@ def collect_answers(args: argparse.Namespace) -> SetupAnswers:
             ["prod", "dev"],
             "prod",
         )
+
+    if not proxy_url and not args.skip_install:
+        if ask_bool("pip など外部アクセス用コマンドにプロキシが必要ですか", False):
+            proxy_url = ask_proxy_url()
 
     shared_root = args.shared_root or ""
     remote_host = args.remote_host or ""
@@ -254,6 +280,7 @@ def collect_answers(args: argparse.Namespace) -> SetupAnswers:
         huggingface_token=hf_token,
         openwebui_api_key=api_key,
         knowledge_id=knowledge_id,
+        proxy_url=proxy_url,
         set_ollama_keep_alive=set_keep_alive,
     )
     validate_answers(answers)
@@ -269,6 +296,8 @@ def validate_answers(answers: SetupAnswers) -> None:
         raise SystemExit("リモート構成では共有ルートが必要です。")
     if answers.webui_port <= 0 or answers.webui_port > 65535:
         raise SystemExit("Open WebUI のポートは 1-65535 で指定してください。")
+    if answers.proxy_url and not answers.proxy_url.startswith(("http://", "https://")):
+        raise SystemExit("プロキシURLは http:// または https:// で始まる値を指定してください。")
 
 
 def venv_python(project_root: Path, venv_name: str = ".venv") -> Path:
@@ -287,13 +316,28 @@ def create_venv(project_root: Path, venv_name: str = ".venv") -> Path:
     return python_path
 
 
-def run_pip(python_path: Path, args: list[str], project_root: Path) -> None:
-    subprocess.run([str(python_path), "-m", "pip", *args], cwd=project_root, check=True)
+def add_pip_proxy(args: list[str], proxy_url: str) -> list[str]:
+    normalized_proxy = normalize_proxy_url(proxy_url)
+    if not normalized_proxy:
+        return args
+    if any(arg == "--proxy" or arg.startswith("--proxy=") for arg in args):
+        return args
+    return [*args, f"--proxy={normalized_proxy}"]
 
 
-def install_main_dependencies(project_root: Path, profile: str) -> None:
+def run_pip(
+    python_path: Path,
+    args: list[str],
+    project_root: Path,
+    proxy_url: str = "",
+) -> None:
+    pip_args = add_pip_proxy(args, proxy_url)
+    subprocess.run([str(python_path), "-m", "pip", *pip_args], cwd=project_root, check=True)
+
+
+def install_main_dependencies(project_root: Path, profile: str, proxy_url: str = "") -> None:
     python_path = create_venv(project_root)
-    run_pip(python_path, ["install", "--upgrade", "pip"], project_root)
+    run_pip(python_path, ["install", "--upgrade", "pip"], project_root, proxy_url)
     if profile == "prod":
         torch_index = "https://download.pytorch.org/whl/cu128"
         torch_version = "2.11.0"
@@ -311,30 +355,46 @@ def install_main_dependencies(project_root: Path, profile: str) -> None:
             torch_index,
         ],
         project_root,
+        proxy_url,
     )
-    run_pip(python_path, ["install", "-r", "requirements.txt"], project_root)
+    run_pip(python_path, ["install", "-r", "requirements.txt"], project_root, proxy_url)
 
 
-def install_client_dependencies(project_root: Path) -> None:
+def install_client_dependencies(project_root: Path, proxy_url: str = "") -> None:
     python_path = create_venv(project_root)
-    run_pip(python_path, ["install", "--upgrade", "pip"], project_root)
-    run_pip(python_path, ["install", "-r", "requirements-client.txt"], project_root)
+    run_pip(python_path, ["install", "--upgrade", "pip"], project_root, proxy_url)
+    run_pip(python_path, ["install", "-r", "requirements-client.txt"], project_root, proxy_url)
 
 
-def install_open_webui(project_root: Path) -> None:
+def install_open_webui(project_root: Path, proxy_url: str = "") -> None:
     python_path = create_venv(project_root, ".venv-webui")
-    run_pip(python_path, ["install", "--upgrade", "pip"], project_root)
-    run_pip(python_path, ["install", f"open-webui=={OPEN_WEBUI_VERSION}"], project_root)
+    run_pip(python_path, ["install", "--upgrade", "pip"], project_root, proxy_url)
+    run_pip(
+        python_path,
+        ["install", f"open-webui=={OPEN_WEBUI_VERSION}"],
+        project_root,
+        proxy_url,
+    )
 
 
-def pull_ollama_models(profile: str) -> None:
+def external_command_env(proxy_url: str) -> dict[str, str] | None:
+    normalized_proxy = normalize_proxy_url(proxy_url)
+    if not normalized_proxy:
+        return None
+    env = os.environ.copy()
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+        env[key] = normalized_proxy
+    return env
+
+
+def pull_ollama_models(profile: str, proxy_url: str = "") -> None:
     if shutil.which("ollama") is None:
         warn("ollama コマンドが見つかりません。Ollama インストール後にモデル取得を実行してください。")
         return
     llm_model = "gemma4:e4b-it-q4_K_M" if profile == "prod" else "gemma3:4b"
     for model in [llm_model, "nomic-embed-text"]:
         info(f"Ollama モデルを取得しています: {model}")
-        subprocess.run(["ollama", "pull", model], check=True)
+        subprocess.run(["ollama", "pull", model], check=True, env=external_command_env(proxy_url))
 
 
 def set_ollama_keep_alive() -> None:
@@ -345,12 +405,13 @@ def set_ollama_keep_alive() -> None:
 
 
 def install_dependencies(project_root: Path, answers: SetupAnswers) -> None:
+    proxy_url = normalize_proxy_url(answers.proxy_url)
     if answers.mode == "remote-client":
-        install_client_dependencies(project_root)
+        install_client_dependencies(project_root, proxy_url)
         return
-    install_main_dependencies(project_root, answers.profile)
-    install_open_webui(project_root)
-    pull_ollama_models(answers.profile)
+    install_main_dependencies(project_root, answers.profile, proxy_url)
+    install_open_webui(project_root, proxy_url)
+    pull_ollama_models(answers.profile, proxy_url)
     if answers.set_ollama_keep_alive:
         set_ollama_keep_alive()
 
@@ -612,6 +673,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--huggingface-token", default="")
     parser.add_argument("--openwebui-api-key", default="")
     parser.add_argument("--knowledge-id", default="")
+    parser.add_argument(
+        "--proxy-url",
+        "--proxy",
+        dest="proxy_url",
+        default="",
+        help="pip など外部アクセス用コマンドで使うプロキシURL",
+    )
     parser.add_argument("--set-ollama-keep-alive", action="store_true")
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--skip-install", action="store_true")
@@ -637,7 +705,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if args.skip_models:
             original_pull = pull_ollama_models
-            globals()["pull_ollama_models"] = lambda _profile: None
+            globals()["pull_ollama_models"] = lambda _profile, _proxy_url="": None
             try:
                 install_dependencies(PROJECT_ROOT, answers)
             finally:
