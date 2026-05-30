@@ -36,6 +36,12 @@ def main() -> int:
     parser.add_argument(
         "--top-k", type=int, default=5, help="上位何件を返すか（デフォルト 5）"
     )
+    parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=None,
+        help="類似度の足切りしきい値（0.0〜1.0）。未指定時は設定ファイルの min_similarity を使用。0.0 で全件表示。",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
@@ -71,12 +77,31 @@ def main() -> int:
         print("[result] ヒットなし")
         return 0
 
-    print(f"\n=== 上位 {len(docs)} 件 ===\n")
-    for rank, (doc, meta, dist) in enumerate(zip(docs, metas, distances), start=1):
+    # --min-similarity が未指定のときは設定ファイルの値を使う（なければ 0.0 = 全件表示）
+    threshold: float = (
+        args.min_similarity
+        if args.min_similarity is not None
+        else settings["chromadb"].get("min_similarity", 0.0)
+    )
+
+    # 類似度がしきい値以上のものだけ表示対象に絞り込む
+    filtered = []
+    for doc, meta, dist in zip(docs, metas, distances):
+        similarity = 1.0 - dist if dist is not None else 0.0
+        if similarity >= threshold:
+            filtered.append((doc, meta, similarity))
+
+    # しきい値フィルタで全件除外された場合は分かりやすいメッセージを表示
+    if not filtered:
+        print(
+            f"[result] 関連の高い結果がありませんでした（しきい値 {threshold:.2f} 未満を除外）"
+        )
+        return 0
+
+    print(f"\n=== 上位 {len(filtered)} 件（類似度 {threshold:.2f} 以上） ===\n")
+    for rank, (doc, meta, similarity) in enumerate(filtered, start=1):
         source = meta.get("source_file", "?") if meta else "?"
         date = meta.get("date", "?") if meta else "?"
-        # コサイン距離 → 類似度概算（1 - distance）
-        similarity = 1.0 - dist if dist is not None else 0.0
         print(f"--- [{rank}] 類似度 {similarity:.3f}  ({source} / {date}) ---")
         # 長すぎるチャンクは先頭 500 文字に省略表示
         snippet = doc if len(doc) <= 500 else doc[:500] + "..."

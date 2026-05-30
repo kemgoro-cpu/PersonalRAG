@@ -87,7 +87,11 @@ llm:
 
 # --- Step 3: 埋め込み・ベクターDB 設定 ---
 embedding:
-  model: nomic-embed-text
+  # bge-m3 は BAAI が公開する多言語埋め込みモデル。
+  # 日本語を含む100言語以上に対応しており、nomic-embed-text（英語中心）より
+  # 日本語のセマンティック検索精度が大幅に向上する。
+  # ※ 次元数が変わるため、モデル変更後は ChromaDB を削除して ingest_db.py --all で再投入すること。
+  model: bge-m3
   host: http://localhost:11434
 
 chromadb:
@@ -95,6 +99,9 @@ chromadb:
   # チャンク分割の目安（トークンではなく文字数で簡易判定）
   chunk_chars: 1500
   chunk_overlap_chars: 200
+  # 検索結果の足切り。類似度(1 - コサイン距離)がこの値未満のチャンクは検索結果から除外する。
+  # 0.0 で無効（全件返す）。0.6 程度が日本語のノイズ除去の目安。
+  min_similarity: 0.6
 
 # --- Step 4: パイプライン設定 ---
 pipeline:

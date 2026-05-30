@@ -387,14 +387,55 @@ def external_command_env(proxy_url: str) -> dict[str, str] | None:
     return env
 
 
+def pull_ollama_model_with_retry(model: str, proxy_url: str = "") -> None:
+    """Ollama モデルを取得する。失敗した場合は再試行・スキップ・中止をユーザーが選べる。
+
+    Args:
+        model: 取得するモデル名（例: "gemma3:4b"）
+        proxy_url: プロキシURL（不要な場合は空文字）
+    """
+    while True:
+        info(f"Ollama モデルを取得しています: {model}")
+        result = subprocess.run(
+            ["ollama", "pull", model],
+            check=False,  # 失敗しても例外を起こさず、自分でハンドリングする
+            env=external_command_env(proxy_url),
+        )
+        if result.returncode == 0:
+            # 取得成功 → 次のモデルへ進む
+            return
+
+        # 取得失敗 → ユーザーに次の行動を選んでもらう
+        warn(f"モデル '{model}' の取得に失敗しました（終了コード: {result.returncode}）。")
+        print("")
+        choice = ask_choice(
+            "どうしますか",
+            ["retry", "skip", "abort"],
+            "retry",
+        )
+        if choice == "retry":
+            # もう一度 ollama pull を試みる
+            info("再試行します...")
+            continue
+        elif choice == "skip":
+            # スキップして処理を続ける
+            warn(
+                f"'{model}' のダウンロードをスキップしました。"
+                f" 後で手動で実行してください: ollama pull {model}"
+            )
+            return
+        else:
+            # abort: セットアップ全体を中止する
+            raise SystemExit(f"セットアップを中止しました（モデル '{model}' の取得をキャンセル）。")
+
+
 def pull_ollama_models(profile: str, proxy_url: str = "") -> None:
     if shutil.which("ollama") is None:
         warn("ollama コマンドが見つかりません。Ollama インストール後にモデル取得を実行してください。")
         return
     llm_model = "gemma4:e4b-it-q4_K_M" if profile == "prod" else "gemma3:4b"
     for model in [llm_model, "nomic-embed-text"]:
-        info(f"Ollama モデルを取得しています: {model}")
-        subprocess.run(["ollama", "pull", model], check=True, env=external_command_env(proxy_url))
+        pull_ollama_model_with_retry(model, proxy_url)
 
 
 def set_ollama_keep_alive() -> None:

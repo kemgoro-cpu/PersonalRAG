@@ -221,13 +221,13 @@ Open WebUI は別 venv に検証済みバージョンを入れる。
 **開発機 (6GB):**
 ```powershell
 ollama pull gemma3:4b
-ollama pull nomic-embed-text
+ollama pull bge-m3
 ```
 
 **本番機 (16GB):**
 ```powershell
 ollama pull gemma4:e4b-it-q4_K_M   # 量子化 Gemma 4（約9.6GB）
-ollama pull nomic-embed-text
+ollama pull bge-m3
 ```
 
 #### Ollama の VRAM 自動解放（必須設定）
@@ -262,7 +262,7 @@ pip install open-webui==0.9.5
 export OFFLINE_MODE=true
 export HF_HUB_OFFLINE=1
 export RAG_EMBEDDING_ENGINE=ollama
-export RAG_EMBEDDING_MODEL=nomic-embed-text
+export RAG_EMBEDDING_MODEL=bge-m3
 export OLLAMA_BASE_URL=http://localhost:11434
 export RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
 export RAG_RERANKING_MODEL_AUTO_UPDATE=false
@@ -279,7 +279,7 @@ pip install open-webui==0.9.5
 $env:OFFLINE_MODE="true"
 $env:HF_HUB_OFFLINE="1"
 $env:RAG_EMBEDDING_ENGINE="ollama"
-$env:RAG_EMBEDDING_MODEL="nomic-embed-text"
+$env:RAG_EMBEDDING_MODEL="bge-m3"
 $env:OLLAMA_BASE_URL="http://localhost:11434"
 $env:RAG_EMBEDDING_MODEL_AUTO_UPDATE="false"
 $env:RAG_RERANKING_MODEL_AUTO_UPDATE="false"
@@ -298,7 +298,7 @@ source .venv-webui/Scripts/activate
 export OFFLINE_MODE=true
 export HF_HUB_OFFLINE=1
 export RAG_EMBEDDING_ENGINE=ollama
-export RAG_EMBEDDING_MODEL=nomic-embed-text
+export RAG_EMBEDDING_MODEL=bge-m3
 export OLLAMA_BASE_URL=http://localhost:11434
 export RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
 export RAG_RERANKING_MODEL_AUTO_UPDATE=false
@@ -808,7 +808,19 @@ python scripts/search.py "先週の会議で決まった納期は？"
 5. 自動同期をまだ設定していない場合は、`data/notes/` の `.md` ファイルを **すべてアップロード**（ドラッグ&ドロップ可）
 6. 新規チャットで右上の `+` から作成した Knowledge を選択 → 質問
 
-> 自前 ChromaDB と Open WebUI 内蔵 RAG は **並行運用**しています。CLI 検索は自前 DB、チャットは Open WebUI 内蔵 DB を使う形です。
+> **自前 ChromaDB と Open WebUI 内蔵 RAG の役割分担**
+>
+> 同じノートが 2 つの DB に入っているため「どちらが本物？」と感じることがありますが、それぞれ別の用途を担っています。
+>
+> | 機能 | 参照先 |
+> |---|---|
+> | CLI 検索（`search.py`） | 自前 ChromaDB（`data/chromadb/`） |
+> | ノートビューアのセマンティック検索 | 自前 ChromaDB（`data/chromadb/`） |
+> | Open WebUI のチャット（Knowledge 参照） | Open WebUI 内蔵 RAG（Knowledge） |
+>
+> - 両 DB の **データの正本は `data/notes/*.md`** です。両方の DB はここから生成される派生物なので、元ファイルが残っている限りいつでも再構築できます。
+> - 埋め込みモデルを `bge-m3` に統一しているため、両 DB の検索傾向は近くなっています。
+> - 自前 ChromaDB は `ingest_db.py` で、Open WebUI Knowledge は `sync_webui.py` でそれぞれ更新されます。
 
 ### E. Open WebUI 自動同期（手動アップロード不要にする）
 
@@ -837,7 +849,7 @@ source .venv-webui/Scripts/activate
 export OFFLINE_MODE=true
 export HF_HUB_OFFLINE=1
 export RAG_EMBEDDING_ENGINE=ollama
-export RAG_EMBEDDING_MODEL=nomic-embed-text
+export RAG_EMBEDDING_MODEL=bge-m3
 export OLLAMA_BASE_URL=http://localhost:11434
 export RAG_EMBEDDING_MODEL_AUTO_UPDATE=false
 export RAG_RERANKING_MODEL_AUTO_UPDATE=false
@@ -1036,6 +1048,63 @@ PowerShell で `ollama list` を実行し、コマンドが通るか確認。通
 ### pyannote が `gated repository` エラー
 
 Hugging Face のモデルページで利用規約に同意していない可能性。[pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) と [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) の両方に対して `Agree and access repository` ボタンを押してください。
+
+### 埋め込みモデルを変更したとき（または bge-m3 へ移行するとき）の手順
+
+埋め込みモデルを変えると、ベクターの「次元数」（数値の個数）が変わります。たとえば `nomic-embed-text` は 768 次元、`bge-m3` は 1024 次元と異なるため、**既存の ChromaDB に保存済みのベクターとは形式が合わなくなります**。古いベクターと新しいモデルが混在すると検索が正しく動かなくなるため、DB を一から作り直す必要があります。
+
+以下の手順を順番に実施してください。
+
+#### 1. 新しい埋め込みモデルを取得する
+
+```powershell
+ollama pull bge-m3
+```
+
+#### 2. 既存の ChromaDB を退避または削除する
+
+```powershell
+# 退避する場合（あとで戻せるように残しておきたいとき）
+Rename-Item data\chromadb data\chromadb_backup_nomic
+
+# または削除する場合（完全にリセット）
+Remove-Item -Recurse -Force data\chromadb
+```
+
+Git Bash の場合:
+
+```bash
+# 退避
+mv data/chromadb data/chromadb_backup_nomic
+
+# または削除
+rm -rf data/chromadb
+```
+
+> ⚠ `personal_rag` コレクションだけを削除したい場合は、Python から `chromadb` ライブラリで `client.delete_collection("personal_rag")` を実行することもできます。フォルダごと退避する方法が最もシンプルでおすすめです。
+
+#### 3. 全ノートを ChromaDB に再投入する
+
+```powershell
+python scripts/ingest_db.py --all
+```
+
+`data/notes/` 内の `.md` がすべて新しい埋め込みモデル（`bge-m3`）でベクター化されて ChromaDB に登録されます。
+
+#### 4. Open WebUI 側の Knowledge を作り直す
+
+Open WebUI 内蔵 RAG も埋め込みモデルを揃えているため、Knowledge の中身も再構築します。
+
+```bash
+# 既存 Knowledge を削除して作り直す場合
+python scripts/sync_webui.py --create-knowledge "PersonalRAG"
+# → 表示された新しい ID を config/settings.yaml の openwebui.knowledge_id に貼る
+
+# 全ノートを再アップロード
+python scripts/sync_webui.py --reupload-all
+```
+
+> Open WebUI の Settings → Documents でも埋め込みモデルを `bge-m3`（Ollama）に揃えておくと、検索傾向がより近くなります。
 
 ---
 

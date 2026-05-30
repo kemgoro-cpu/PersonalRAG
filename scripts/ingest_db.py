@@ -80,10 +80,12 @@ def strip_frontmatter(text: str) -> tuple[dict[str, str], str]:
 
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
-    """テキストを文字数ベースでチャンク分割する。
+    """テキストを文/行の境界を考慮してチャンク分割する。
 
-    まず Markdown 見出し（## など）で大きく分け、それでも長い場合は
-    max_chars 単位でスライドウィンドウ的に分割する。
+    まず Markdown 見出し（## など）で大きく分け、それでも長いセクションは
+    句点「。」や改行を境界として文/行の単位に区切り、max_chars を超えない
+    範囲で貪欲に連結してチャンクを作る。これにより日本語文の途中でぶつ切りに
+    なる問題を防ぎ、検索精度を向上させる。
 
     Args:
         text: 入力テキスト。
@@ -93,23 +95,106 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
     Returns:
         チャンクのリスト（空チャンクは除外）。
     """
-    # 見出しで分割（## 以上、ただし先頭の `---` フロントマターは事前に剥がしてある前提）
+
+    def split_into_sentences(section: str) -> list[str]:
+        """セクションを「文」の単位に分割する。
+
+        句点「。」の直後、または改行を区切りとして文を切り出す。
+        区切り文字自体は直前の文に含める（句点は文末として保持）。
+        """
+        # 句点「。」の直後 か 改行 を区切りに分割する正規表現。
+        # split すると区切り文字が消えるため、findall + 残余を使って句点を保持する。
+        parts: list[str] = []
+        # 「句点で終わる塊」または「改行を含まない行末の塊」を順に取り出す
+        pattern = re.compile(r"[^。\n]*。|[^\n]+")
+        for m in pattern.finditer(section):
+            s = m.group()
+            if s:
+                parts.append(s)
+        return parts if parts else [section]
+
+    def split_long_section(section: str) -> list[str]:
+        """max_chars を超えるセクションを文境界ベースでチャンク化する。
+
+        手順:
+          1. セクションを文/行の単位に分割する。
+          2. 各文を max_chars を超えない範囲で貪欲に結合してチャンクを作る。
+          3. 1 文が単体で max_chars を超える場合は文字数で強制分割（フォールバック）。
+          4. 各チャンクの先頭に前チャンク末尾の overlap 文字分を付加する。
+        """
+        sentences = split_into_sentences(section)
+        result: list[str] = []
+        # 現在構築中のチャンクに含まれる文のリスト
+        current_parts: list[str] = []
+        current_len = 0
+
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+
+            # 1 文自体が max_chars を超える極端ケース → 文字数で強制分割（フォールバック）
+            if len(sent) > max_chars:
+                # まず積み上げ中の文があればチャンクとして確定
+                if current_parts:
+                    result.append("".join(current_parts))
+                    current_parts = []
+                    current_len = 0
+                # overlap 付与後も max_chars に収まるよう、スライスサイズを調整する。
+                # 後段の overlap 処理で先頭に最大 overlap 文字が追加されるため、
+                # 1 スライス = max_chars - overlap 文字として切る（2枚目以降の長さを担保）。
+                # ただし overlap が 0 の場合は max_chars そのまま使う。
+                slice_size = max(1, max_chars - overlap)
+                start = 0
+                while start < len(sent):
+                    result.append(sent[start : start + slice_size])
+                    start += slice_size
+                continue
+
+            # 今の文を追加するとチャンクが max_chars を超えるか判定
+            if current_len + len(sent) > max_chars and current_parts:
+                # 現在の積み上げを 1 チャンクとして確定
+                result.append("".join(current_parts))
+                current_parts = []
+                current_len = 0
+
+            current_parts.append(sent)
+            current_len += len(sent)
+
+        # ループ終了後に残った文もチャンクとして確定
+        if current_parts:
+            result.append("".join(current_parts))
+
+        # --- overlap 処理: 前チャンクの末尾 overlap 文字を次チャンクの先頭に付加 ---
+        # 文脈の連続性を保つため、各チャンクの先頭に前チャンク末尾を重ねる。
+        if overlap <= 0 or len(result) <= 1:
+            return result
+
+        overlapped: list[str] = [result[0]]
+        for i in range(1, len(result)):
+            prefix = result[i - 1][-overlap:]  # 前チャンク末尾 overlap 文字
+            overlapped.append(prefix + result[i])
+        return overlapped
+
+    # --- メイン処理: まず Markdown 見出しでセクションに分割 ---
+    # （先頭の `---` フロントマターは事前に strip_frontmatter で除去済みが前提）
     sections = re.split(r"\n(?=#{1,6}\s)", text)
     chunks: list[str] = []
+
     for section in sections:
         section = section.strip()
         if not section:
             continue
+
         if len(section) <= max_chars:
+            # max_chars 以内なら分割不要、そのまま 1 チャンクとして追加
             chunks.append(section)
         else:
-            # スライドウィンドウで分割
-            start = 0
-            step = max(1, max_chars - overlap)
-            while start < len(section):
-                chunks.append(section[start : start + max_chars])
-                start += step
-    return chunks
+            # 長いセクションは文/行境界ベースで分割
+            chunks.extend(split_long_section(section))
+
+    # 空チャンクを除外して返す
+    return [c for c in chunks if c.strip()]
 
 
 def embed_text(text: str, embedding_cfg: dict[str, Any]) -> list[float]:

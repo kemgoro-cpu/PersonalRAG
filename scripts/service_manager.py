@@ -473,7 +473,8 @@ class ServiceManager:
             return ServiceInfo(
                 name="Open WebUI",
                 status=ServiceStatus.UNKNOWN,
-                detail=f"起動中（PID={managed_pid}、HTTP 応答待ち）",
+                # 初回起動は30〜60秒かかるため、ユーザーが「固まった?」と誤解しないよう明示する
+                detail=f"起動中（初回は30〜60秒かかります。PID={managed_pid}）",
                 pid=managed_pid,
             )
 
@@ -484,7 +485,8 @@ class ServiceManager:
             return ServiceInfo(
                 name="Open WebUI",
                 status=ServiceStatus.UNKNOWN,
-                detail=f"起動中（外部起動 PID={pid}、HTTP 応答待ち）",
+                # こちらも同様に時間がかかることを明示する
+                detail=f"起動中（初回は30〜60秒かかります。外部起動 PID={pid}）",
                 pid=pid,
             )
 

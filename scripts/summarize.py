@@ -144,6 +144,8 @@ def call_ollama(
     response = client.generate(
         model=llm_cfg["model"],
         prompt=prompt,
+        # OllamaのJSONモード: モデルにJSON形式での出力を強制し、構造崩れを防ぐ
+        format="json",
         options={
             "temperature": llm_cfg.get("temperature", 0.3),
             "num_ctx": llm_cfg.get("num_ctx", 8192),

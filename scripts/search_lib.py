@@ -24,6 +24,7 @@ def search_semantic(
     query: str,
     top_k: int = 10,
     settings: dict[str, Any] | None = None,
+    min_similarity: float | None = None,
 ) -> list[dict[str, Any]]:
     """ChromaDB に対してセマンティック検索を行い、結果リストを返す。
 
@@ -36,6 +37,10 @@ def search_semantic(
         top_k: 上位何件を返すか（デフォルト 10）。
         settings: load_settings() で読み込んだ設定辞書。
                   None の場合はこの関数内で load_settings() を呼ぶ。
+        min_similarity: 類似度（0.0〜1.0）の足切りしきい値。
+                        この値未満のチャンクは結果から除外する。
+                        None の場合は settings["chromadb"]["min_similarity"]（デフォルト 0.0）を使う。
+                        0.0 を渡すと全件返す（無効化）。
 
     Returns:
         検索結果のリスト。各要素は以下のキーを持つ辞書:
@@ -63,6 +68,12 @@ def search_semantic(
         settings = load_settings()
 
     chromadb_cfg: dict[str, Any] = settings["chromadb"]
+
+    # min_similarity が引数で指定されていない場合は設定ファイルの値を使う
+    # 設定ファイルにも書かれていなければ 0.0（全件返す＝無効）
+    if min_similarity is None:
+        min_similarity = chromadb_cfg.get("min_similarity", 0.0)
+
     embedding_cfg: dict[str, Any] = settings["embedding"]
     chromadb_dir: Path = resolve_path(settings["paths"]["chromadb_dir"])
     notes_dir: Path = resolve_path(settings["paths"]["notes_dir"])
@@ -112,6 +123,10 @@ def search_semantic(
 
         # コサイン距離 → 類似度（1 - distance）
         similarity: float = 1.0 - dist if dist is not None else 0.0
+
+        # 類似度がしきい値未満のチャンクはノイズとして除外する
+        if similarity < min_similarity:
+            continue
 
         # ノートファイルの絶対パスを特定する（path traversal 対策付き）
         # ingest_db.py は source_file にファイル名（拡張子付き）を入れる
