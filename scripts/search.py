@@ -31,8 +31,20 @@ def embed_query(query: str, embedding_cfg: dict[str, Any]) -> list[float]:
 
 def main() -> int:
     """エントリポイント。"""
-    parser = argparse.ArgumentParser(description="ChromaDB から類似検索")
-    parser.add_argument("query", type=str, help="検索したい質問・キーワード")
+    parser = argparse.ArgumentParser(
+        description="ChromaDB から類似検索",
+        epilog=(
+            "使用例:\n"
+            "  python scripts/search.py \"先週の会議で決まった納期は？\"\n"
+            "  python scripts/search.py \"ECUのテストについて\" --top-k 3\n"
+            "  python scripts/search.py \"会議メモ\" --min-similarity 0.6\n"
+            "\n"
+            "※ データがまだない場合は先に `python scripts/ingest_db.py --all` を実行してください。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # query は任意引数（nargs="?"）にして、未指定時はヘルプを表示して終了する
+    parser.add_argument("query", type=str, nargs="?", default=None, help="検索したい質問・キーワード")
     parser.add_argument(
         "--top-k", type=int, default=5, help="上位何件を返すか（デフォルト 5）"
     )
@@ -43,6 +55,11 @@ def main() -> int:
         help="類似度の足切りしきい値（0.0〜1.0）。未指定時は設定ファイルの min_similarity を使用。0.0 で全件表示。",
     )
     args = parser.parse_args()
+
+    # query が未指定の場合はヘルプを表示して正常終了する
+    if args.query is None:
+        parser.print_help()
+        return 0
 
     settings = load_settings()
     chromadb_cfg = settings["chromadb"]
@@ -55,7 +72,9 @@ def main() -> int:
     except Exception as e:
         print(
             f"[error] コレクションが見つかりません: {e}\n"
-            f"        先に `python scripts/ingest_db.py --all` で投入してください。",
+            f"        まだ検索用のデータベースが作られていません。\n"
+            f"        先に音声/テキストを処理してから、`python scripts/ingest_db.py --all` を実行してください。\n"
+            f"        （詳しくは README の『使い方 C』を参照してください）",
             file=sys.stderr,
         )
         return 1

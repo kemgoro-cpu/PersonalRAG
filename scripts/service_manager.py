@@ -335,7 +335,10 @@ class ServiceManager:
         """Ollama の稼働状態を HTTP で確認する。
 
         GET http://localhost:11434/api/tags が 200 なら RUNNING。
-        タイムアウト（2 秒）・接続失敗・例外はすべて STOPPED 扱い。
+        タイムアウト（2 秒）は「応答なし」、接続失敗・その他例外は「停止中」として区別する。
+
+        GUI 側が初回ポーリング前に「確認中...（数秒お待ちください）」と表示するため、
+        このメソッドはポーリング完了後の結果だけを返せばよい。
         """
         try:
             import requests
@@ -353,7 +356,12 @@ class ServiceManager:
                     detail = f"稼働中（PID={pid}）"
                 return ServiceInfo(name="Ollama", status=ServiceStatus.RUNNING,
                                    detail=detail, pid=pid)
+        except requests.exceptions.Timeout:
+            # HTTP 要求を送ったが 2 秒以内に応答がなかった（プロセスは存在するが重い可能性）
+            return ServiceInfo(name="Ollama", status=ServiceStatus.STOPPED,
+                               detail="応答なし（2秒以内に応答がありませんでした）")
         except Exception:
+            # 接続拒否・ポート未開放など → 停止中として扱う
             pass
         return ServiceInfo(name="Ollama", status=ServiceStatus.STOPPED, detail="停止中")
 
@@ -434,6 +442,9 @@ class ServiceManager:
                 else:
                     self._processes.pop("Open WebUI", None)
 
+        # タイムアウトだったかどうかをフラグで管理する（後の分岐で「応答なし」文言に使う）
+        timed_out = False
+
         try:
             import requests
             # まず /health を試す
@@ -464,17 +475,27 @@ class ServiceManager:
                             detail = f"稼働中（PID={pid}）"
                         return ServiceInfo(name="Open WebUI", status=ServiceStatus.RUNNING,
                                            detail=detail, pid=pid)
+            except requests.exceptions.Timeout:
+                # HTTP 要求を送ったが 2 秒以内に応答なし（起動途中の可能性が高い）
+                timed_out = True
             except requests.exceptions.ConnectionError:
-                pass  # 下の STOPPED へ落ちる
+                pass  # 接続拒否 → 下の STOPPED／UNKNOWN 判定へ落ちる
         except Exception as exc:
             logger.debug(f"Open WebUI 状態チェック例外: {exc}")
 
         if managed_pid is not None:
+            if timed_out:
+                # プロセスは生きているが HTTP 応答がない → 起動途中か重い状態
+                # 「応答なし」と「起動中」を両方ユーザーに伝えて混乱を防ぐ
+                detail = f"応答なし（起動中の可能性あり。初回は30〜60秒かかります。PID={managed_pid}）"
+            else:
+                # 接続拒否 → まだ HTTP サーバーが立ち上がっていない（起動直後に多い）
+                # 初回起動は30〜60秒かかるため、ユーザーが「固まった?」と誤解しないよう明示する
+                detail = f"起動中（初回は30〜60秒かかります。PID={managed_pid}）"
             return ServiceInfo(
                 name="Open WebUI",
                 status=ServiceStatus.UNKNOWN,
-                # 初回起動は30〜60秒かかるため、ユーザーが「固まった?」と誤解しないよう明示する
-                detail=f"起動中（初回は30〜60秒かかります。PID={managed_pid}）",
+                detail=detail,
                 pid=managed_pid,
             )
 
@@ -482,11 +503,15 @@ class ServiceManager:
         pids = self._find_listening_pids(port) if port is not None else []
         if pids:
             pid = pids[0]
+            if timed_out:
+                detail = f"応答なし（起動中の可能性あり。初回は30〜60秒かかります。外部起動 PID={pid}）"
+            else:
+                # こちらも同様に時間がかかることを明示する
+                detail = f"起動中（初回は30〜60秒かかります。外部起動 PID={pid}）"
             return ServiceInfo(
                 name="Open WebUI",
                 status=ServiceStatus.UNKNOWN,
-                # こちらも同様に時間がかかることを明示する
-                detail=f"起動中（初回は30〜60秒かかります。外部起動 PID={pid}）",
+                detail=detail,
                 pid=pid,
             )
 

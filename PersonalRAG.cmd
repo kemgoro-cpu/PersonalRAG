@@ -13,6 +13,10 @@ if not exist "%PYTHONW%" (
     echo        %PYTHONW%
     echo.
     echo Run scripts\setup.ps1 or create the .venv environment first.
+    echo.
+    echo [Setup hint] If setup.ps1 fails due to execution policy, run this first:
+    echo   PowerShell: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+    echo   (Japanese) PowerShell で上のコマンドを実行してから setup.ps1 を再実行してください。
     if "%CHECK_ONLY%"=="1" exit /b 1
     pause
     exit /b 1

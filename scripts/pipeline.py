@@ -632,7 +632,11 @@ def process_audio(
                 "error": "ファイルが安定しないためスキップ",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ stable_wait 失敗: {audio_path.name}", "warning")
+        notify(
+            "PersonalRAG",
+            f"✗ ファイル書込み待ちタイムアウト【{audio_path.name}】ファイルがまだ書込み中の可能性があります",
+            "warning",
+        )
         _handle_step_failure("ファイルが安定しないためスキップ")
         return
 
@@ -647,7 +651,11 @@ def process_audio(
                 "error": "transcribe 失敗",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ transcribe 失敗: {audio_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ 文字起こし失敗【{audio_path.name}】ログを確認してください（data/logs/pipeline.log）",
+            "error",
+        )
         _handle_step_failure("transcribe 失敗")
         return
 
@@ -664,7 +672,11 @@ def process_audio(
                 "error": "transcript ファイルが見つからない",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ transcript なし: {audio_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ 文字起こし結果なし【{audio_path.name}】ログを確認してください（data/logs/pipeline.log）",
+            "error",
+        )
         _handle_step_failure("transcript ファイルが見つからない")
         return
     logger.info(f"transcript: {transcript_path.name}")
@@ -703,7 +715,11 @@ def process_audio(
                 "error": "summarize 失敗",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ summarize 失敗: {audio_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ 要約失敗【{audio_path.name}】Ollamaが起動しているか確認してください",
+            "error",
+        )
         _handle_step_failure("summarize 失敗")
         return
 
@@ -718,7 +734,11 @@ def process_audio(
                 "error": "note ファイルが見つからない",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ note なし: {audio_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ 要約ノートなし【{audio_path.name}】ログを確認してください（data/logs/pipeline.log）",
+            "error",
+        )
         _handle_step_failure("note ファイルが見つからない")
         return
     logger.info(f"note: {note_path.name}")
@@ -744,7 +764,11 @@ def process_audio(
                 "error": "ingest_db 失敗",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ ingest_db 失敗: {audio_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ DB投入失敗【{audio_path.name}】ChromaDBのエラーログを確認してください",
+            "error",
+        )
         _handle_step_failure("ingest_db 失敗")
         return
 
@@ -809,7 +833,11 @@ def process_audio(
 
     # 成功時のトースト通知（設定で notify_on_success: false にすると抑制できる）
     if notify_on_success:
-        notify("PersonalRAG", f"✓ 要約完了: {audio_path.name}", "info")
+        notify(
+            "PersonalRAG",
+            f"✓ 要約作成完了【{audio_path.name}】ノートビューアで確認できます",
+            "info",
+        )
 
     logger.info(f"=== 処理完了: {audio_path.name} ===\n")
 
@@ -1029,7 +1057,11 @@ def process_text(
                 "error": "ファイルが安定しないためスキップ",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ stable_wait 失敗: {text_path.name}", "warning")
+        notify(
+            "PersonalRAG",
+            f"✗ ファイル書込み待ちタイムアウト【{text_path.name}】ファイルがまだ書込み中の可能性があります",
+            "warning",
+        )
         _handle_step_failure("ファイルが安定しないためスキップ")
         return
 
@@ -1044,7 +1076,11 @@ def process_text(
                 "error": "import_transcript 失敗",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ import_transcript 失敗: {text_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ テキスト取込み失敗【{text_path.name}】ファイル形式を確認してください",
+            "error",
+        )
         _handle_step_failure("import_transcript 失敗")
         return
 
@@ -1063,7 +1099,11 @@ def process_text(
                 "error": "transcript ファイルが見つからない",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ transcript なし: {text_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ 取込み結果なし【{text_path.name}】ログを確認してください（data/logs/pipeline.log）",
+            "error",
+        )
         _handle_step_failure("transcript ファイルが見つからない")
         return
     logger.info(f"transcript: {transcript_path.name}")
@@ -1089,7 +1129,11 @@ def process_text(
                 "error": "summarize 失敗",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ summarize 失敗: {text_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ 要約失敗【{text_path.name}】Ollamaが起動しているか確認してください",
+            "error",
+        )
         _handle_step_failure("summarize 失敗")
         return
 
@@ -1104,7 +1148,11 @@ def process_text(
                 "error": "note ファイルが見つからない",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ note なし: {text_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ 要約ノートなし【{text_path.name}】ログを確認してください（data/logs/pipeline.log）",
+            "error",
+        )
         _handle_step_failure("note ファイルが見つからない")
         return
     logger.info(f"note: {note_path.name}")
@@ -1130,7 +1178,11 @@ def process_text(
                 "error": "ingest_db 失敗",
             })
             write_state(state_file, current=None, queue=queue, recent=recent, logger=logger)
-        notify("PersonalRAG", f"✗ ingest_db 失敗: {text_path.name}", "error")
+        notify(
+            "PersonalRAG",
+            f"✗ DB投入失敗【{text_path.name}】ChromaDBのエラーログを確認してください",
+            "error",
+        )
         _handle_step_failure("ingest_db 失敗")
         return
 
@@ -1184,7 +1236,11 @@ def process_text(
 
     # 成功時のトースト通知（設定で notify_on_success: false にすると抑制できる）
     if notify_on_success:
-        notify("PersonalRAG", f"✓ 要約完了: {text_path.name}", "info")
+        notify(
+            "PersonalRAG",
+            f"✓ 要約作成完了【{text_path.name}】ノートビューアで確認できます",
+            "info",
+        )
 
     logger.info(f"=== テキスト処理完了: {text_path.name} ===\n")
 

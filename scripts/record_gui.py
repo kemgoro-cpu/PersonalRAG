@@ -286,7 +286,14 @@ class RecordingApp:
             self.root.after(
                 300,
                 lambda: messagebox.showwarning(
-                    "ホットキー登録失敗", self.hotkey_warning
+                    "ショートカットキーが使えません",
+                    f"録音のショートカットキー（{self.hotkey.upper()}）を登録できませんでした。\n\n"
+                    "【原因】他のアプリ（Zoomなど）が同じキーを使っている可能性があります。\n\n"
+                    "【対処法】\n"
+                    "・競合しているアプリを終了してから PersonalRAG を再起動してください。\n"
+                    "・または config/settings.yaml の recording.hotkey を別のキー（例: ctrl+alt+w）に変更してください。\n\n"
+                    "ボタンとシステムトレイのメニューからは引き続き録音できます。\n\n"
+                    f"（詳細: {self.hotkey_warning}）",
                 ),
             )
 
@@ -312,11 +319,14 @@ class RecordingApp:
         self._color_orange = "#FF9500"
         self._color_red = "#FF3B30"
 
-        base_font = ("Yu Gothic UI", 10)
-        title_font = ("Yu Gothic UI", 20, "bold")
-        section_font = ("Yu Gothic UI", 12, "bold")
-        status_font = ("Yu Gothic UI", 15, "bold")
-        small_font = ("Yu Gothic UI", 9)
+        # settings.yaml の ui.font_size を読んでフォントサイズを決める。
+        # キーが存在しなくても動くよう .get() で安全に取得し、既定値は 10 とする。
+        _ui_font_size: int = int(self._settings.get("ui", {}).get("font_size", 10))
+        base_font = ("Yu Gothic UI", _ui_font_size)
+        title_font = ("Yu Gothic UI", _ui_font_size + 10, "bold")
+        section_font = ("Yu Gothic UI", _ui_font_size + 2, "bold")
+        status_font = ("Yu Gothic UI", _ui_font_size + 5, "bold")
+        small_font = ("Yu Gothic UI", max(_ui_font_size - 1, 8))
 
         style.configure(".", font=base_font)
         style.configure("App.TFrame", background=self._color_bg)
@@ -418,7 +428,51 @@ class RecordingApp:
         # ×ボタンの挙動: 完全終了せずトレイへ収納（トレイが無ければ確認の上で完全終了）
         self.root.protocol("WM_DELETE_WINDOW", self._on_minimize_to_tray)
 
+        # L4: キーボード操作の拡充 — Ctrl+Tab / Ctrl+Shift+Tab でタブを前後に切り替える。
+        # tkinter の TNotebook は標準では Ctrl+Tab をバインドしないため、明示的に登録する。
+        self.root.bind("<Control-Tab>", self._on_ctrl_tab_next)
+        self.root.bind("<Control-Shift-Tab>", self._on_ctrl_tab_prev)
+
         self._manual_refresh_console()
+
+    # ------------------------------------------------------------------
+    # キーボードショートカット（L4）
+    # ------------------------------------------------------------------
+
+    def _on_ctrl_tab_next(self, event: Any = None) -> str:
+        """Ctrl+Tab: メインタブを次に切り替える。
+
+        TNotebook のタブ数を取得し、最後のタブなら最初に戻る（循環）。
+        戻り値 "break" は tkinter のデフォルト動作（フォーカス移動）をキャンセルするために必要。
+        """
+        notebook = getattr(self, "_main_notebook", None)
+        if notebook is None:
+            return "break"
+        tabs = notebook.tabs()
+        if not tabs:
+            return "break"
+        current_index = notebook.index("current")
+        # 最後のタブなら最初に戻る
+        next_index = (current_index + 1) % len(tabs)
+        notebook.select(next_index)
+        return "break"  # デフォルトのフォーカス移動を抑止する
+
+    def _on_ctrl_tab_prev(self, event: Any = None) -> str:
+        """Ctrl+Shift+Tab: メインタブを前に切り替える。
+
+        最初のタブなら最後に戻る（循環）。
+        """
+        notebook = getattr(self, "_main_notebook", None)
+        if notebook is None:
+            return "break"
+        tabs = notebook.tabs()
+        if not tabs:
+            return "break"
+        current_index = notebook.index("current")
+        # 最初のタブなら最後に戻る
+        prev_index = (current_index - 1) % len(tabs)
+        notebook.select(prev_index)
+        return "break"
 
     def _build_status_card(
         self,
@@ -444,7 +498,8 @@ class RecordingApp:
             row=0, column=0, columnspan=2, sticky="w"
         )
 
-        self.status_var = tk.StringVar(value="待機中")
+        # M5: 記号を使って色だけに依存しない状態表示にする（■ = 停止/待機）
+        self.status_var = tk.StringVar(value="■ 待機中")
         self.status_label = ttk.Label(frame, textvariable=self.status_var, style="Status.TLabel")
         self.status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 12))
 
@@ -1012,7 +1067,15 @@ class RecordingApp:
                     f"{service} の {label} 要求を送信しました: {command_path.name}"
                 )
         except Exception as exc:
-            messagebox.showerror("サービス操作に失敗", f"コマンドを書き込めませんでした:\n{exc}")
+            # 初心者向け: NAS接続問題の対処法を案内する
+            messagebox.showerror(
+                "リモート操作コマンドを送れませんでした",
+                f"NASの制御フォルダにコマンドを書き込めませんでした。\n\n"
+                "【確認してほしいこと】\n"
+                "・NAS（ネットワークドライブ）への接続が切れていないか確認してください。\n"
+                "・NASの制御フォルダへの書き込み権限があるか確認してください。\n\n"
+                f"（詳細: {exc}）",
+            )
         self._update_remote_services_status()
 
     def _update_remote_services_status(self) -> None:
@@ -1154,7 +1217,15 @@ class RecordingApp:
         try:
             devices = sd.query_devices()
         except Exception as exc:
-            messagebox.showerror("デバイス取得エラー", f"マイクデバイス一覧の取得に失敗しました:\n{exc}")
+            # 初心者向け: 何が起きたか＋どう直すかを説明する
+            messagebox.showerror(
+                "マイクが見つかりません",
+                f"マイクデバイスの一覧を取得できませんでした。\n\n"
+                "【確認してほしいこと】\n"
+                "・Windowsの「スタート」→「設定」→「サウンド」でマイクが有効になっているか確認してください。\n"
+                "・マイクのUSBケーブルや接続が外れていないか確認してください。\n\n"
+                f"（詳細: {exc}）",
+            )
             return
 
         labels: list[str] = ["（既定の入力デバイス）"]
@@ -1295,7 +1366,16 @@ class RecordingApp:
             err = self.recorder.last_error()
             if err is not None:
                 self._force_idle()
-                messagebox.showerror("録音エラー", f"録音中に問題が発生しました:\n{err}")
+                # 初心者向け: 録音中断の理由と対処法を案内する
+                messagebox.showerror(
+                    "録音が中断されました",
+                    f"録音中に問題が発生し、自動的に停止しました。\n\n"
+                    "【確認してほしいこと】\n"
+                    "・マイクの接続が外れていないか確認してください。\n"
+                    "・保存先フォルダの空き容量が少なくなっていないか確認してください。\n"
+                    "・問題が続く場合は、一度アプリを再起動してみてください。\n\n"
+                    f"（詳細: {err}）",
+                )
 
         # 3) 録音状態の表示更新
         if self.state == AppState.RECORDING:
@@ -1312,7 +1392,8 @@ class RecordingApp:
                     self.silence_announced = True
                     self._show_silence_dialog()
             else:
-                self.status_var.set(f"録音中  {elapsed_str}")
+                # 色覚特性への配慮（M5）: 色変化だけでなく「● 録音中」のように記号でも状態を示す
+                self.status_var.set(f"● 録音中  {elapsed_str}")
                 self.status_label.config(foreground="black")
                 if self.tray_icon is not None:
                     self.tray_icon.title = f"PersonalRAG 録音中 {elapsed_str}"
@@ -1510,9 +1591,15 @@ class RecordingApp:
             output_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             # NAS 切断・権限不足など
+            # 初心者向け: NAS切断・権限不足など、原因ごとの対処法を案内する
             messagebox.showerror(
-                "保存先エラー",
-                f"保存先フォルダを準備できません:\n{output_path.parent}\n\n{exc}",
+                "録音ファイルの保存先を準備できません",
+                f"録音ファイルを保存するフォルダを作成・確認できませんでした。\n\n"
+                "【確認してほしいこと】\n"
+                "・NAS（ネットワークドライブ）を使っている場合、接続が切れていないか確認してください。\n"
+                "・保存先フォルダへの書き込み権限があるか確認してください。\n"
+                "・config/settings.yaml の paths.recordings_dir の設定が正しいか確認してください。\n\n"
+                f"保存先: {output_path.parent}\n（詳細: {exc}）",
             )
             return
 
@@ -1520,17 +1607,26 @@ class RecordingApp:
         try:
             self.recorder.start(output_path, device=self.selected_device)
         except Exception as exc:
-            messagebox.showerror("録音開始エラー", f"録音を開始できませんでした:\n{exc}")
+            # 初心者向け: 録音開始失敗の対処法を案内する
+            messagebox.showerror(
+                "録音を開始できませんでした",
+                f"マイクへのアクセスに失敗しました。\n\n"
+                "【確認してほしいこと】\n"
+                "・マイクが正しく接続されているか確認してください。\n"
+                "・Windowsの「プライバシー設定」でこのアプリにマイクへのアクセス許可が与えられているか確認してください。\n"
+                "・別のアプリがマイクを占有していないか確認してください（Zoomなど）。\n\n"
+                f"（詳細: {exc}）",
+            )
             return
 
         self.current_output = output_path
         self.state = AppState.RECORDING
         self.silence_announced = False
 
-        # UI 更新
+        # UI 更新（M5: 色覚特性への配慮として記号も添える）
         self.toggle_button.config(text="録音停止")
         self.device_combobox.config(state="disabled")
-        self.status_var.set("録音中  00:00:00")
+        self.status_var.set("● 録音中  00:00:00")
         self.status_label.config(foreground="black")
         self.path_var.set(str(output_path))
         if self.tray_icon is not None and self._red_image is not None:
@@ -1546,7 +1642,14 @@ class RecordingApp:
         try:
             saved = self.recorder.stop()
         except Exception as exc:
-            messagebox.showerror("録音停止エラー", f"録音停止中に問題が発生しました:\n{exc}")
+            # 初心者向け: 停止時のエラーも分かりやすく案内する
+            messagebox.showerror(
+                "録音の停止に問題が発生しました",
+                f"録音を停止する際にエラーが発生しました。\n"
+                "録音ファイルは一部保存されている場合があります。\n\n"
+                "問題が続く場合はアプリを再起動してください。\n\n"
+                f"（詳細: {exc}）",
+            )
             saved = self.current_output
 
         self.state = AppState.IDLE
@@ -1558,7 +1661,8 @@ class RecordingApp:
 
         if saved is None:
             # そもそも保存先パスが取れていない（録音開始前の異常停止など）
-            self.status_var.set("待機中")
+            # M5: 記号で状態を示す（■ = 停止）
+            self.status_var.set("■ 待機中")
         elif not voice_detected:
             # 一度も音声を検知していないので WAV を削除する。
             # pipeline.py が空っぽのファイルに無駄な文字起こしを走らせるのを防ぐ。
@@ -1573,7 +1677,8 @@ class RecordingApp:
                 meta_path.unlink(missing_ok=True)
             except Exception:
                 pass
-            self.status_var.set(f"無音のため削除しました: {saved.name}")
+            # M5: 「⚠」記号で無音を示す（色だけに頼らない）
+            self.status_var.set(f"⚠ 無音のため削除しました: {saved.name}")
             self.path_var.set(str(self.recordings_dir))
             tray_title = "PersonalRAG 録音（無音破棄）"
         else:
@@ -1590,10 +1695,11 @@ class RecordingApp:
                 saved_is_watched = False
 
             if saved_is_watched:
-                self.status_var.set(f"保存しました: {saved.name}")
+                # M5: 「✓」記号で保存成功を示す
+                self.status_var.set(f"✓ 保存しました: {saved.name}")
             else:
                 self.status_var.set(
-                    f"保存しました: {saved.name}（Pipeline 監視対象外）"
+                    f"✓ 保存しました: {saved.name}（Pipeline 監視対象外）"
                 )
             self.path_var.set(str(saved))
 
@@ -1965,9 +2071,16 @@ class RecordingApp:
                         "外部起動のプロセスです。検出した PID を taskkill で停止します。",
                     )
             elif info.status == ServiceStatus.UNKNOWN:
-                # 起動中または HTTP 応答待ち: プロセスはあるので停止操作は許可する。
-                status_label.config(text="◐ 起動中", foreground="#b36b00")
-                detail_label.config(text=info.detail, foreground="#7a4a00")
+                # 起動中または HTTP 応答待ち: プロセスはあるので停止操作は許可する（H1）。
+                # Open WebUI は HTTP 応答まで時間がかかるため、ユーザーに待機を促す文言を追加する。
+                if name == "Open WebUI":
+                    status_label.config(text="◐ 起動中（初回は30〜60秒かかります）", foreground="#b36b00")
+                    # detail が service_manager から届いていればそれを表示、なければ補足メッセージを出す
+                    detail_text = info.detail if info.detail else "HTTP 応答待ち中です。しばらくお待ちください…"
+                    detail_label.config(text=detail_text, foreground="#7a4a00")
+                else:
+                    status_label.config(text="◐ 起動中", foreground="#b36b00")
+                    detail_label.config(text=info.detail, foreground="#7a4a00")
                 btn.config(text="停止", state="normal")
                 self._set_tooltip(
                     btn,
@@ -2066,6 +2179,16 @@ class RecordingApp:
         if self._all_services_in_progress:
             return
 
+        # 誤爆防止: 操作前に確認ダイアログを表示する（M4）
+        confirmed = messagebox.askyesno(
+            "すべてのサービスを起動しますか？",
+            "Ollama・Pipeline・Open WebUI の 3 つのサービスをまとめて起動します。\n\n"
+            "起動には時間がかかる場合があります（特に Open WebUI は初回 30〜60 秒ほど）。\n\n"
+            "続けますか？",
+        )
+        if not confirmed:
+            return
+
         # フラグを立てて、両ボタンを無効化（main スレッドなので直接操作可）
         self._all_services_in_progress = True
         if self._start_all_btn:
@@ -2110,6 +2233,17 @@ class RecordingApp:
         """
         # フラグが True = すでに別の一括操作が走っている → 無視
         if self._all_services_in_progress:
+            return
+
+        # 誤爆防止: 停止は影響が大きいため、確認ダイアログを表示する（M4）
+        confirmed = messagebox.askyesno(
+            "すべてのサービスを停止しますか？",
+            "Ollama・Pipeline・Open WebUI の 3 つのサービスをまとめて停止します。\n\n"
+            "⚠ 注意: Pipeline が処理中（文字起こし・要約など）の場合、\n"
+            "その処理も中断されます。\n\n"
+            "続けますか？",
+        )
+        if not confirmed:
             return
 
         # フラグを立てて、両ボタンを無効化
@@ -2179,17 +2313,26 @@ class RecordingApp:
         pythonw = PROJECT_ROOT / ".venv" / "Scripts" / "pythonw.exe"
 
         if not viewer_script.exists():
+            # 初心者向け: ファイルが見つからない原因と対処法を案内する
             messagebox.showerror(
-                "エラー",
-                f"ノートビューアスクリプトが見つかりません:\n{viewer_script}",
+                "ノートビューアが見つかりません",
+                f"ノートビューアのスクリプトファイルが見つかりませんでした。\n\n"
+                "【確認してほしいこと】\n"
+                "・PersonalRAG を正しくセットアップしたか確認してください。\n"
+                "・scripts フォルダに note_viewer.py が存在するか確認してください。\n\n"
+                f"（探したパス: {viewer_script}）",
             )
             return
 
         if not pythonw.exists():
+            # 初心者向け: 仮想環境のセットアップ方法を案内する
             messagebox.showerror(
-                "エラー",
-                f"pythonw.exe が見つかりません:\n{pythonw}\n\n"
-                "仮想環境が正しくセットアップされているか確認してください。",
+                "Python仮想環境が見つかりません",
+                f"仮想環境（.venv）が見つかりませんでした。\n\n"
+                "【確認してほしいこと】\n"
+                "・README の手順に従って仮想環境をセットアップしてください。\n"
+                "  （例: python -m venv .venv → .venv\\Scripts\\activate → pip install -r requirements.txt）\n\n"
+                f"（探したパス: {pythonw}）",
             )
             return
 
@@ -2201,8 +2344,10 @@ class RecordingApp:
             )
         except Exception as exc:
             messagebox.showerror(
-                "起動エラー",
-                f"ノートビューアを起動できませんでした:\n{exc}",
+                "ノートビューアを起動できませんでした",
+                f"ノートビューアの起動中にエラーが発生しました。\n\n"
+                "アプリを再起動してもう一度お試しください。\n\n"
+                f"（詳細: {exc}）",
             )
 
     def _on_change_recordings_dir(self) -> None:
@@ -2355,7 +2500,15 @@ class RecordingApp:
                 if isinstance(parsed, list):
                     history = parsed
         except Exception as e:
-            messagebox.showerror("失敗一覧", f"failed_files.json の読み込みに失敗しました:\n{e}")
+            # 初心者向け: ログファイルが壊れている場合の対処法を案内する
+            messagebox.showerror(
+                "隔離ファイル一覧を読み込めませんでした",
+                f"処理失敗ファイルの記録（failed_files.json）を読み込めませんでした。\n\n"
+                "【確認してほしいこと】\n"
+                "・NAS（ネットワークドライブ）に接続中か確認してください。\n"
+                "・ファイルが壊れている場合は data/logs/failed_files.json を削除してください（削除すると一覧がリセットされます）。\n\n"
+                f"（詳細: {e}）",
+            )
             return
 
         # Toplevel ダイアログを作成
@@ -2703,7 +2856,15 @@ class RecordingApp:
             text = self._pipeline_state_file.read_text(encoding="utf-8")
             data = json.loads(text)
         except Exception as e:
-            messagebox.showerror("パイプライン詳細", f"状態ファイルの読み込みに失敗しました:\n{e}")
+            # 初心者向け: 状態ファイルが壊れている場合の対処法を案内する
+            messagebox.showerror(
+                "処理状況を読み込めませんでした",
+                f"パイプラインの状態ファイルを読み込めませんでした。\n\n"
+                "【確認してほしいこと】\n"
+                "・pipeline.py が起動中か確認してください。\n"
+                "・NAS（ネットワークドライブ）に接続中か確認してください。\n\n"
+                f"（詳細: {e}）",
+            )
             return
 
         recent = data.get("recent", [])
@@ -2930,7 +3091,16 @@ def main() -> int:
         try:
             tmp = tk.Tk()
             tmp.withdraw()
-            messagebox.showerror("起動エラー", f"録音 GUI を起動できませんでした:\n{exc}")
+            # 初心者向け: 起動失敗時の対処法を案内する
+            messagebox.showerror(
+                "アプリを起動できませんでした",
+                f"録音 GUI の起動中にエラーが発生しました。\n\n"
+                "【確認してほしいこと】\n"
+                "・config/settings.yaml の内容が正しいか確認してください。\n"
+                "・仮想環境（.venv）が正しくセットアップされているか確認してください。\n"
+                "・README の「セットアップ手順」をもう一度確認してください。\n\n"
+                f"（詳細: {exc}）",
+            )
             tmp.destroy()
         except Exception:
             print(f"[record_gui] 起動エラー: {exc}", file=sys.stderr)

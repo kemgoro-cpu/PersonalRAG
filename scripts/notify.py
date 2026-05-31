@@ -8,8 +8,12 @@ pipeline.py / record_gui.py など複数スクリプトから共通で使う通�
 
 使い方:
     from notify import notify
-    notify("PersonalRAG", "✓ 要約完了: sample.wav", "info")
-    notify("PersonalRAG", "✗ transcribe 失敗: broken.wav\nエラー内容", "error")
+
+    # 成功時: ファイル名と「ノートビューアで確認できます」の案内を入れる
+    notify("PersonalRAG", "✓ 要約作成完了【sample.wav】ノートビューアで確認できます", "info")
+
+    # 失敗時: 何が失敗したかと、次にすべき操作のヒントを入れる
+    notify("PersonalRAG", "✗ 文字起こし失敗【broken.wav】ログを確認してください", "error")
 """
 
 from __future__ import annotations

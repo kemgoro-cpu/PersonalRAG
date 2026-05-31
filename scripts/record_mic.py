@@ -76,6 +76,7 @@ def record(output_path: Path, sample_rate: int, channels: int) -> None:
         recorder.stop()
 
     print(f"[mic] 保存しました: {output_path}")
+    print("[mic] ✓ 完了")
 
 
 def main() -> int:

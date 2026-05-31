@@ -156,3 +156,6 @@ openwebui:
 ui:
   local_service_management: false
   pipeline_stale_seconds: 30
+  # GUI のフォントサイズ（pt）。10/12/14 などから選べる。
+  # 大きくすると見やすいがウィンドウに収まりにくくなる。
+  font_size: 10
